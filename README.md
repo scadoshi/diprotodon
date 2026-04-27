@@ -6,7 +6,7 @@ Speaks the RESP protocol over TCP. Built by hand to sharpen Rust async/concurren
 
 ## Why "diprotodon"
 
-The diprotodon was a giant marsupial — basically a hippo-sized wombat — that roamed Australia until ~40,000 years ago. Sophisticated, lumbering, ancient. The Rust version of this project gets the dignified extinct-giant name. The Go version is its goofy modern cousin: [wombat](../wombat).
+The diprotodon was a giant marsupial — basically a hippo-sized wombat — that roamed Australia until ~40,000 years ago. Sophisticated, lumbering, ancient. The Rust version of this project gets the dignified extinct-giant name.
 
 ## Status
 
@@ -22,4 +22,4 @@ See `context/CLAUDE.md`.
 
 ## Sibling
 
-A Go port of this same feature ladder lives at `~/Work/wombat`. Same family (Vombatiformes — diprotodon and modern wombats share a suborder), different language, different lessons.
+A Go port of this same feature ladder lives in the `wombat` repo. Same family (Vombatiformes — diprotodon and modern wombats share a suborder), different language, different lessons.
