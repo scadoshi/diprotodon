@@ -2,3 +2,14 @@
 name = "diprotodon"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "diprotodon"
+path = "src/main.rs"
+
+[lib]
+name = "diprotodon"
+path = "src/lib/lib.rs"
+
+[dependencies]
+thiserror = "2.0.18"
