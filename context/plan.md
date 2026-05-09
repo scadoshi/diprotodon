@@ -1,57 +1,81 @@
-# diprotodon — Milestone Plan
+# diprotodon — Progress
 
-Lifted from the master study plan at `~/Work/appetizers/ideas/redis-mini-study-plan.md`. Milestones live here so the project is self-contained; the master plan owns the broader interview-prep trajectory.
+Lifted from the master study plan at `~/Work/appetizers/ideas/redis-mini-study-plan.md`. This file tracks where the project actually is; the master plan owns the broader interview-prep trajectory.
 
-## Phase 0 — Pre-study (concepts, ~1 evening)
+## Where I am
 
-- TCP server fundamentals: socket → bind → listen → accept → read/write loop
-- Concurrency models: thread-per-connection vs event loop vs goroutines vs async tasks
-- Read the RESP protocol spec end-to-end: https://redis.io/docs/reference/protocol-spec/
-- Skim the Redis command reference for the commands you'll implement
+Custom line-based protocol over TCP, thread-per-connection, in-memory `HashMap<String, String>` behind `Arc<Mutex>`, basic snapshot persistence via `wincode`. No RESP, no TTL, no async.
 
-## Phase 1 — Rust refresh (~1 evening)
+## Status by milestone
 
-- tokio fundamentals: TcpListener, TcpStream, AsyncRead/AsyncWrite, spawn
-- tokio::sync primitives: mpsc, broadcast, RwLock, Mutex
-- Sharing state: Arc<RwLock<HashMap>> vs actor-pattern with mpsc
-- Cancellation / graceful shutdown: CancellationToken, signal::ctrl_c
-- Reference (don't copy): https://github.com/tokio-rs/mini-redis
+### M0 — TCP echo server ✅
+- [x] `TcpListener` bind + accept loop (`run.rs`)
+- [x] Thread-per-connection via `std::thread::spawn`
+- [x] Per-connection `Session` struct owns reader/writer halves
 
-## Phase 2 — Build M0–M3 (~2 weekends)
+### M1 — Protocol + dispatch 🟡 (custom format, not RESP)
+- [x] Line-based reader (`BufReader::read_line`)
+- [x] `Command` enum with `TryFrom<&str>` parser
+- [x] Dispatch in `Session::execute`
+- [ ] **RESP parser** — current parser is bespoke `GET key` / `SET key value` text. RESP rewrite still owed.
+- [ ] PING/PONG
 
-### M0 — TCP echo server (~1 hour)
-- TcpListener, accept loop, per-connection task
-- Echo back whatever you read
+### M2 — GET / SET / DEL ✅ (EXISTS pending)
+- [x] `Cache` API: `get`, `set`, `delete` (returns prior value where relevant)
+- [x] `Arc<Mutex<HashMap>>` behind a real method boundary
+- [x] Generic `impl AsRef<str>` / `impl Into<String>` ergonomics
+- [ ] EXISTS
 
-### M1 — RESP parser + PING/PONG (~half day)
-- Parse Bulk Strings, Arrays, Simple Strings
-- Dispatch one command (PING)
-- Hand-write the parser. No nom, no combine, no shortcuts.
+### M3 — EXPIRE / TTL / PEXPIRE ⬜
+- [ ] Track per-key expiry timestamps (rework value type)
+- [ ] Lazy expiration on read
+- [ ] Active background sweep
 
-### M2 — GET / SET / DEL / EXISTS (~half day)
-- In-memory `HashMap<String, Vec<u8>>` behind `Arc<RwLock<...>>`
-- Command dispatch table
+### M4 — Persistence 🟡 (snapshot done, AOF pending)
+- [x] Snapshot serialize via `wincode`, load on `Cache::init`
+- [x] Truncate + create file on persist
+- [x] Lock released before disk I/O
+- [ ] **Persist loop is broken** — current `spawn` runs *once* after 10s, never again. Wrap in `loop`.
+- [ ] Crash safety: write to `cache.tmp` then `rename` over `cache`
+- [ ] Decide: keep snapshot model or move to true AOF (append every write)
 
-### M3 — EXPIRE / TTL / PEXPIRE (~half day)
-- Track expiry timestamps
-- Lazy expiration on read
-- Active background sweep (a tokio task ticking on an interval)
+### M5 — Pub/Sub ⬜
+- [ ] PUBLISH / SUBSCRIBE
+- [ ] Fan-out (probably `std::sync::mpsc` per subscriber, or migrate to tokio broadcast)
 
-## Phase 4 — M4 AOF persistence (~1 weekend)
+### M6 — Stretch ⬜
+- [ ] RDB snapshots, MULTI/EXEC, Streams, RESP3
 
-- Append every write to a log file
-- Replay on boot to rebuild state
-- Decide flush policy (always vs every-second vs no)
+## Cross-cutting work owed
 
-## Phase 5 — M5 Pub/Sub (~1 weekend)
+- **Graceful shutdown** — Ctrl-C kills mid-loop, last writes lost. Plan below.
+- **Async migration** — currently `std::thread` per connection. Tokio rewrite owed before M5 (broadcast fan-out wants async). Master plan assumes tokio from the start; doing it sync first was a deliberate detour to feel the threading model.
+- **Connection lifecycle on errors** — `get_command` writes errors back and `continue`s; on a broken stream this can hot-loop. Audit when wiring shutdown.
+- **`Session` vs `Cache` error types** — `ReplError` wraps both; review whether the split still makes sense once RESP lands.
 
-- PUBLISH / SUBSCRIBE
-- `tokio::sync::broadcast` is the natural fit
-- Fan-out from one publisher to N subscribers
+## Graceful shutdown plan
 
-## Phase 6 — Stretch (only if time)
+The server has no exit path. Ctrl-C kills the process mid-loop and any cache mutations from the last persist tick are lost. Fix this before M3.
 
-- M6: RDB snapshots, MULTI/EXEC, Streams, RESP3
+### Goals
+
+- Catch SIGINT (Ctrl-C) and SIGTERM (`kill <pid>`)
+- Stop accepting new connections
+- Run one final `cache.persist()` before returning
+- Return cleanly from `Runner::run`
+
+### Things to investigate
+
+- `ctrlc` crate vs writing the signal handler directly with `signal-hook` or `nix`
+- How to break out of `listener.accept()` — it blocks. Options: non-blocking listener + poll, `set_nonblocking(true)` + sleep, or shutdown via a second socket trick
+- Sharing a "should I keep running" flag across threads — `Arc<AtomicBool>` is the obvious one but think about whether it's the right shape
+- Whether existing connection threads should be drained, killed, or left to die when the process exits
+- Once async/tokio lands, this rewrites entirely — `tokio::signal::ctrl_c` + `CancellationToken`
+
+### Don't
+
+- Reach for AI before reading the `ctrlc` docs and one example
+- Add async just to get `tokio::select!` — the sync version teaches more
 
 ## Discipline note
 
