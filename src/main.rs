@@ -1,3 +1,7 @@
+use diprotodon::run::Runner;
+
 fn main() {
-    diprotodon::runner::Runner::run();
+    if let Err(e) = Runner::run() {
+        eprintln!("Failed to run: {}", e);
+    }
 }

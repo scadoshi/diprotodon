@@ -73,3 +73,76 @@ impl TryFrom<&str> for Command {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_from_str_ok() {
+        assert!(matches!(
+            Command::try_from("get key"),
+            Ok(Command::Get { .. })
+        ));
+        assert!(matches!(
+            Command::try_from("g key"),
+            Ok(Command::Get { .. })
+        ));
+        assert!(matches!(
+            Command::try_from("set key value"),
+            Ok(Command::Set { .. })
+        ));
+        assert!(matches!(
+            Command::try_from("s key value"),
+            Ok(Command::Set { .. })
+        ));
+        assert!(matches!(
+            Command::try_from("delete key"),
+            Ok(Command::Delete { .. })
+        ));
+        assert!(matches!(
+            Command::try_from("del key"),
+            Ok(Command::Delete { .. })
+        ));
+        assert!(matches!(
+            Command::try_from("d key"),
+            Ok(Command::Delete { .. })
+        ));
+    }
+
+    #[test]
+    fn try_from_str_err() {
+        assert!(matches!(
+            Command::try_from("get key key"),
+            Err(CommandError::TooManyParts)
+        ));
+        assert!(matches!(
+            Command::try_from("set key value value"),
+            Err(CommandError::TooManyParts)
+        ));
+        assert!(matches!(
+            Command::try_from("delete key key"),
+            Err(CommandError::TooManyParts)
+        ));
+        assert!(matches!(
+            Command::try_from("get"),
+            Err(CommandError::NotEnoughParts)
+        ));
+        assert!(matches!(
+            Command::try_from("set key"),
+            Err(CommandError::NotEnoughParts)
+        ));
+        assert!(matches!(
+            Command::try_from("set"),
+            Err(CommandError::NotEnoughParts)
+        ));
+        assert!(matches!(
+            Command::try_from("delete"),
+            Err(CommandError::NotEnoughParts)
+        ));
+        assert!(matches!(
+            Command::try_from("unrecognized key"),
+            Err(CommandError::UnrecognizedCommand)
+        ));
+    }
+}
