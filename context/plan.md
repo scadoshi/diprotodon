@@ -35,7 +35,7 @@ Custom line-based protocol over TCP, thread-per-connection, in-memory `HashMap<S
 - [x] Snapshot serialize via `wincode`, load on `Cache::init`
 - [x] Truncate + create file on persist
 - [x] Lock released before disk I/O
-- [ ] **Persist loop is broken** — current `spawn` runs *once* after 10s, never again. Wrap in `loop`.
+- [x] **Persist loop is broken** — current `spawn` runs *once* after 10s, never again. Wrap in `loop`.
 - [ ] Crash safety: write to `cache.tmp` then `rename` over `cache`
 - [ ] Decide: keep snapshot model or move to true AOF (append every write)
 
