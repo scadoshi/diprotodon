@@ -50,12 +50,13 @@ impl TryFrom<&str> for Command {
         let Some((command_str, arguments_str)) = value.split_once(' ') else {
             return Err(CommandError::NotEnoughParts);
         };
-        if command_str == "get" || command_str == "g" {
+        let command_str = command_str.to_lowercase();
+        if command_str == "get" {
             if arguments_str.split_once(' ').is_some() {
                 return Err(CommandError::TooManyParts);
             }
             Ok(Self::get(arguments_str))
-        } else if command_str == "set" || command_str == "s" {
+        } else if command_str == "set" {
             let Some((key, value)) = arguments_str.split_once(' ') else {
                 return Err(CommandError::NotEnoughParts);
             };
@@ -63,7 +64,7 @@ impl TryFrom<&str> for Command {
                 return Err(CommandError::TooManyParts);
             }
             Ok(Self::set(key, value))
-        } else if command_str == "delete" || command_str == "del" || command_str == "d" {
+        } else if command_str == "del" {
             if arguments_str.split_once(' ').is_some() {
                 return Err(CommandError::TooManyParts);
             }
@@ -85,27 +86,11 @@ mod tests {
             Ok(Command::Get { .. })
         ));
         assert!(matches!(
-            Command::try_from("g key"),
-            Ok(Command::Get { .. })
-        ));
-        assert!(matches!(
             Command::try_from("set key value"),
             Ok(Command::Set { .. })
         ));
         assert!(matches!(
-            Command::try_from("s key value"),
-            Ok(Command::Set { .. })
-        ));
-        assert!(matches!(
-            Command::try_from("delete key"),
-            Ok(Command::Delete { .. })
-        ));
-        assert!(matches!(
             Command::try_from("del key"),
-            Ok(Command::Delete { .. })
-        ));
-        assert!(matches!(
-            Command::try_from("d key"),
             Ok(Command::Delete { .. })
         ));
     }
