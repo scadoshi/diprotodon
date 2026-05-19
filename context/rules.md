@@ -24,17 +24,7 @@ Read it. Then read it again. Then try to fix it. Then ask AI. Compiler errors ar
 
 ## Commit guidelines
 
-One feature, one commit. Easier to:
-- Compare Rust vs Go sibling later
-- Show the journey in interview conversation
-- Roll back if a milestone goes sideways
-
-Message conventions:
-- Concise, one-line messages (multi-line only when many changes)
-- Group related files logically
-- No emojis
-- Use `git diff` to understand changes before committing
-- **Never** include AI-agent signatures in commits (no "Co-Authored-By: Claude...", no "Generated with...")
+See [commit_guidelines.md](commit_guidelines.md).
 
 ## Tests
 
