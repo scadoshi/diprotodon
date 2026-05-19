@@ -106,7 +106,7 @@ mod tests {
             Err(CommandError::TooManyParts)
         ));
         assert!(matches!(
-            Command::try_from("delete key key"),
+            Command::try_from("del key key"),
             Err(CommandError::TooManyParts)
         ));
         assert!(matches!(
@@ -122,7 +122,7 @@ mod tests {
             Err(CommandError::NotEnoughParts)
         ));
         assert!(matches!(
-            Command::try_from("delete"),
+            Command::try_from("del"),
             Err(CommandError::NotEnoughParts)
         ));
         assert!(matches!(
