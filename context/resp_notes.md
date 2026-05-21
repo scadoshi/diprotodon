@@ -106,3 +106,66 @@ bytes -> RespValue -> Command
 - Serializer is the inverse: `Reply -> bytes`. `RespValue` is reusable for the reply side (you'll need to *write* RESP, not just read it).
 
 Easier to test each layer in isolation. Easier to talk about in an interview ("I separated framing from semantics so the parser doesn't need to learn new commands when I add EXISTS").
+
+## Implementation decisions (running log)
+
+Captured as the parser comes together. Not a spec — just what was chosen and why, so future-me doesn't re-litigate.
+
+### `Value` enum shape
+
+Only two variants for now: `Array(Vec<Value>)` and `BulkString(Vec<u8>)`. That's the entire inbound surface (commands are always arrays of bulk strings). Reply-side variants (`SimpleString`, `Integer`, `SimpleError`, null bulk) get added when the serializer lands — no point modeling them before they're parsed or emitted.
+
+### `BulkString(Vec<u8>)`, not `String`
+
+First pass was `String`. Switched to `Vec<u8>` to stay binary-safe — RESP bulk payloads are arbitrary bytes (could be a jpeg, could contain interior `\r\n`). `String` would force UTF-8 validation at parse time and reject valid frames. Cost of `Vec<u8>`: command dispatch has to `std::str::from_utf8` the command-name slice when matching `b"get"` / `b"set"` / `b"del"`, which is cheap (borrow, no allocation).
+
+### Parser signature
+
+```rust
+fn parse_one(bytes: &[u8]) -> Result<(Value, &[u8]), ValueError>
+```
+
+- Free-standing (well, associated method on `Value`) — not a `TryFrom` impl, because `TryFrom` can't return the leftover slice. `TryFrom<&[u8]> for Value` stays as the outer entry point that parses exactly one whole frame.
+- Borrows in, borrows out — no allocation for the leftover. The "rest of the buffer" is a sub-slice of the input, so it shares the input's lifetime (elided).
+- `Result<_, ValueError>` instead of a three-state `Ok/Err/Incomplete` enum — incompleteness is just one variant of `ValueError` (`BytesLenMismatch`, etc.). Works fine for synchronous read-and-retry; if we move to streaming we may want a real `Incomplete` variant the caller can distinguish from malformed.
+
+### Helper: `Crlf` trait on `[u8]`
+
+`utils.rs` exposes two extension methods on `[u8]`:
+
+- `is_crlf(&self) -> bool` — true iff the slice starts with `\r\n`.
+- `split_crlf(&self) -> Option<(&[u8], &[u8])>` — find the first `\r\n`, return (before, after). `None` if no `\r\n` anywhere — i.e. incomplete header.
+
+Both return borrows. The trait shape is just for the `bytes.split_crlf()` ergonomics; nothing else implements it.
+
+### Length parsing without allocation
+
+```rust
+std::str::from_utf8(&sigil_len_str[1..])?.parse::<usize>()?
+```
+
+`from_utf8` returns `&str` — a view over the existing bytes, no allocation. `.parse::<usize>()` consumes the `&str`. Two error types collapsed into one `ParseLengthError` enum (`Utf8` + `ParseInt`) with `#[from]` conversions so `?` works.
+
+Could roll a digit-by-digit accumulator (`n = n*10 + (b - b'0') as usize`) and skip the validation entirely — more interview-flex, shows what `parse` does under the hood. Not done yet, but on the table.
+
+### `parse_bulk_string(bytes, len)`
+
+Header is parsed by `parse_one` (which has already consumed `$<n>\r\n` via `split_crlf`). `parse_bulk_string` takes the bytes *after* the header and the pre-parsed length, returns the value and the leftover *after* the trailing `\r\n`.
+
+Three things it must do (TODO: trailing `\r\n` consumption and validation still owed at time of writing):
+
+1. Bounds-check: `bytes.len() >= len + 2` (payload + terminator), else incomplete.
+2. Validate `&bytes[len..len+2] == b"\r\n"` — if the length lied, frame is malformed.
+3. Return `&bytes[len+2..]` as the leftover, not `&bytes[len..]`.
+
+### `parse_array(bytes, len)`
+
+Stubbed. The plan: loop `len` times, each iteration calls `parse_one` on the current leftover, pushes the resulting `Value` into a `Vec`, threads the new leftover forward. Final return: `(Value::Array(vec), leftover)`. State lives on the call stack — no `Parser<Mode>` machinery needed for this scope.
+
+### Considered and rejected: split-all-on-`\r\n`
+
+Tempting one-liner: `bytes.split(|&b| ...)` to chop the whole frame into tokens. Forbidden — bulk-string payloads can contain `\r\n` (`$6\r\nhe\r\nlo\r\n` is a 6-byte payload `he\r\nlo`, valid), and split would shred it. The only correct framer respects length prefixes and counts bytes.
+
+### Considered and rejected: `Parser<Mode>` type-state machine
+
+Overkill. The state needed to parse one frame fits on the call stack via recursion. A type-state machine is what you reach for when streaming megabyte values chunk-by-chunk without materializing them, or when enforcing "you can't call `read_body` before `read_header`" at compile time. Not in scope.
