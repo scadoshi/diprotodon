@@ -6,7 +6,7 @@ Lifted from the master study plan at `~/Work/appetizers/ideas/redis-mini-study-p
 
 Custom line-based protocol over TCP, thread-per-connection, in-memory `HashMap<String, String>` behind `Arc<Mutex>`, basic snapshot persistence via `wincode`. No TTL, no async.
 
-RESP migration started — byte-splitter (`Clrf::split_crlf`) landed in `src/lib/resp/utils.rs` with tests. Parser layer is the next session's work.
+**RESP parser is complete and tested** — `Value::parse_one(&[u8]) -> Result<(Value, &[u8]), ValueError>` in `src/lib/resp/parser/value.rs`. Module restructured into `src/lib/resp/{parser,serializer}/`. Serializer dir scaffolded but empty. Next M1 work: `Value → Command` mapping, then the serializer, then wiring both into `Session` to replace the bespoke text parser.
 
 ## Status by milestone
 
@@ -15,19 +15,18 @@ RESP migration started — byte-splitter (`Clrf::split_crlf`) landed in `src/lib
 - [x] Thread-per-connection via `std::thread::spawn`
 - [x] Per-connection `Session` struct owns reader/writer halves
 
-### M1 — Protocol + dispatch 🟡 (RESP parser in progress)
+### M1 — Protocol + dispatch 🟡 (RESP parser done, dispatch + serializer next)
 - [x] Line-based reader (`BufReader::read_line`)
 - [x] `Command` enum with `TryFrom<&str>` parser
 - [x] Dispatch in `Session::execute`
-- [x] **Byte-slice utilities** — `Clrf` trait in `src/lib/resp/utils.rs` with `is_crlf` and `split_crlf`. Contract A: `split_crlf` returns `None` when no CRLF terminator is found in the buffer. That `None` is the load-bearing "Incomplete" signal for the parser layer above — do not collapse it into a `Some` with an empty rest slice (would lie to the caller).
-- [ ] **RESP parser layer (next up)** — function over `&[u8]` that dispatches on sigil and recurses for arrays. Sits on top of `split_crlf`. Notes worked out in `resp_notes.md`.
-  - Tri-state return shape still owed: custom enum (`Parsed::Ok | Err | Incomplete`) vs `Result<Option<T>, E>` vs nom-style `Err(Incomplete)`. Leaning custom enum — recursion will do explicit matches anyway, and self-documenting variants help. Decide when building.
-  - `RespValue` enum shape: `Array(Vec<u8>)` (flat) vs `Array(Vec<RespValue>)` (recursive). User leaning recursive — "fine and fun and cool." Recursive is what the spec describes; flat would force re-parsing.
-  - Errors only exist at this layer, not at `split_crlf`. Don't push error variants down into the byte splitter.
-  - Then map `RespValue -> Command` (the second layer the notes describe).
-- [ ] PING/PONG (trivial once parser lands)
-- [ ] Replace bespoke `TryFrom<&str>` command parser with RESP-driven dispatch
-- [ ] Minor: `Clrf` trait name vs `crlf` method spelling — pick one casing
+- [x] **Byte-slice utilities** — `Crlf` trait in `src/lib/resp/parser/crlf.rs` with `is_crlf` and `split_crlf`. Contract A: `split_crlf` returns `None` when no CRLF is found. That `None` is the load-bearing Incomplete signal for the parser layer above — do not collapse it into a `Some` with an empty rest slice (would lie to the caller).
+- [x] **RESP parser layer** — `Value::parse_one(&[u8]) -> Result<(Value, &[u8]), ValueError>` in `src/lib/resp/parser/value.rs`. Dispatches on sigil, recurses via `parse_array` (iterative — not stack-recursive; `MGET key1..key1000` won't blow the stack), bottoms out at `parse_bulk_string`. Error variants: `Incomplete`, `Malformed`, `UnknownSigil`, `InvalidLength(ParseLengthError)`, `MissingTerminator`. Tests cover the byte-counting property (interior `\r\n` in a bulk payload), empty array, nested array, leftover-bytes preservation, and every error variant.
+- [x] Drop `TryFrom<&[u8]> for Value` — leftover-bytes contract is structural to streaming and `TryFrom` can't carry it. (Note: `resp_notes.md` running log still mentions `TryFrom` as the entry point — divergence is intentional.)
+- [ ] **`Value → Command` mapping (next)** — second layer the notes describe. Take a `Value::Array(Vec<Value::BulkString>)`, validate shape ("first element is the verb, rest are args"), ASCII-uppercase the verb, dispatch to `Command`. Rejects non-array top-level frames (per scope decision in `resp_notes.md`).
+- [ ] **Serializer** — `src/lib/resp/serializer/` dir scaffolded but empty. Output types per `resp_notes.md` line 35: SimpleString, BulkString, NullBulk, Integer, SimpleError. Open design choice: extend `Value` with output-only variants vs. build a separate `Reply` enum. Not decided.
+- [ ] Wire RESP parser + serializer into `Session`; remove bespoke `TryFrom<&str>` text parser.
+- [ ] PING/PONG — trivial once dispatch maps `Command::Ping` to `Reply::SimpleString("PONG")`.
+- [ ] Pre-existing nit: in `parse_one`, length parse runs before sigil check, so `+OK\r\n` returns `InvalidLength` instead of `UnknownSigil`. Only matters if you ever support `+`/`-`/`:` inbound (you won't, per scope).
 
 ### M2 — GET / SET / DEL ✅ (EXISTS pending)
 - [x] `Cache` API: `get`, `set`, `delete` (returns prior value where relevant)

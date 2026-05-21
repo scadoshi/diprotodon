@@ -125,7 +125,7 @@ First pass was `String`. Switched to `Vec<u8>` to stay binary-safe — RESP bulk
 fn parse_one(bytes: &[u8]) -> Result<(Value, &[u8]), ValueError>
 ```
 
-- Free-standing (well, associated method on `Value`) — not a `TryFrom` impl, because `TryFrom` can't return the leftover slice. `TryFrom<&[u8]> for Value` stays as the outer entry point that parses exactly one whole frame.
+- Free-standing (well, associated method on `Value`) — not a `TryFrom` impl, because `TryFrom` can't return the leftover slice. ~~`TryFrom<&[u8]> for Value` stays as the outer entry point that parses exactly one whole frame.~~ **Update:** `TryFrom` got dropped entirely. The leftover-bytes contract is structural to streaming and there's no caller that wants the "one whole frame" shape without the leftover. `Value::parse_one` is the public entry point.
 - Borrows in, borrows out — no allocation for the leftover. The "rest of the buffer" is a sub-slice of the input, so it shares the input's lifetime (elided).
 - `Result<_, ValueError>` instead of a three-state `Ok/Err/Incomplete` enum — incompleteness is just one variant of `ValueError` (`BytesLenMismatch`, etc.). Works fine for synchronous read-and-retry; if we move to streaming we may want a real `Incomplete` variant the caller can distinguish from malformed.
 
