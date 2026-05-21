@@ -1,0 +1,48 @@
+pub trait Crlf {
+    fn is_crlf(&self) -> bool;
+    fn split_crlf(&self) -> Option<(&[u8], &[u8])>;
+}
+
+impl Crlf for [u8] {
+    fn is_crlf(&self) -> bool {
+        if let (Some(first_byte), Some(second_byte)) = (self.first(), self.get(1)) {
+            *first_byte == b'\r' && *second_byte == b'\n'
+        } else {
+            false
+        }
+    }
+    fn split_crlf(&self) -> Option<(&[u8], &[u8])> {
+        let p = self
+            .windows(2)
+            .position(|w| w[0] == b'\r' && w[1] == b'\n')?;
+        Some((&self[..p], &self[p + 2..]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn is_clrf_true() {
+        assert!(b"\r\n".is_crlf());
+    }
+    #[test]
+    fn is_clrf_false() {
+        assert!(!b"abc".is_crlf());
+    }
+    #[test]
+    fn split_crlf_some() {
+        assert_eq!(
+            b"a\r\na".split_crlf(),
+            Some(("a".as_bytes(), "a".as_bytes()))
+        );
+        assert_eq!(b"a\r\n".split_crlf(), Some(("a".as_bytes(), "".as_bytes())));
+        assert_eq!(b"\r\na".split_crlf(), Some(("".as_bytes(), "a".as_bytes())));
+        assert_eq!(b"\r\n".split_crlf(), Some(("".as_bytes(), "".as_bytes())));
+    }
+    #[test]
+    fn split_crlf_none() {
+        assert!(b"a".split_crlf().is_none());
+        assert!(b"".split_crlf().is_none());
+    }
+}
