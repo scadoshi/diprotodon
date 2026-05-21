@@ -40,10 +40,13 @@ Order of attack (per study plan): **Rust M0–M3 first** (Prax pressure), then t
 
 ## Discipline rules
 
-See `context/rules.md`. The short version:
+See `context/rules.md` — the **AI collaboration mode** section at the top of that file is mandatory reading for any AI assistant.
+
+The short version:
 
 - **Write by hand:** RESP parser, command dispatch, core data structures, connection loop.
 - **AI lane:** boilerplate (Cargo.toml deps, test scaffolding), explanations, debugging help *after* you've read the compiler error yourself.
+- **AI mode:** guide educationally. No straight answers, no code in `.rs` files. Lead with questions. Affirm correctness when it's right; don't push the user toward unnecessary churn.
 - **Read compiler errors first.** Always.
 - **Commit small.** One feature, one commit.
 
