@@ -1,4 +1,4 @@
-trait Crlf {
+pub trait Crlf {
     fn is_crlf(&self) -> bool;
     fn split_crlf(&self) -> Option<(&[u8], &[u8])>;
 }
