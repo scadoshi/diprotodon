@@ -23,25 +23,25 @@ pub enum CacheError {
 
 #[derive(Clone, Debug)]
 pub struct Cache {
-    inner: Arc<Mutex<HashMap<String, String>>>,
+    inner: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 }
 
 impl Cache {
-    pub fn get(&self, key: impl AsRef<str>) -> Result<Option<String>, CacheError> {
+    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, CacheError> {
         let guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
         Ok(guard.get(key.as_ref()).cloned())
     }
 
     pub fn set(
         &self,
-        key: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Result<Option<String>, CacheError> {
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>, CacheError> {
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
         Ok(guard.insert(key.into(), value.into()))
     }
 
-    pub fn delete(&self, key: impl AsRef<str>) -> Result<Option<String>, CacheError> {
+    pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, CacheError> {
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
         Ok(guard.remove(key.as_ref()))
     }

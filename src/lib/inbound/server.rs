@@ -1,11 +1,11 @@
 use std::{net::TcpListener, thread::spawn};
 
-use crate::{cache::Cache, session::Session};
+use crate::{domain::cache::Cache, inbound::session::Session};
 
 const BIND_ADDRESS: &str = "127.0.0.1:3000";
 
-pub struct Runner;
-impl Runner {
+pub struct Server;
+impl Server {
     pub fn run() -> anyhow::Result<()> {
         let listener = TcpListener::bind(BIND_ADDRESS)?;
         println!("listening on {}", BIND_ADDRESS);

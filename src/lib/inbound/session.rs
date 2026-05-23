@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{
+use crate::domain::{
     cache::{Cache, CacheError},
     command::Command,
 };
@@ -72,17 +72,17 @@ impl Session {
     pub fn execute(&mut self, command: Command) -> Result<(), CacheError> {
         let mut response = match command {
             Command::Get { key } => match self.cache.get(&key) {
-                Ok(Some(value)) => format!("{} => {}", key, value),
-                Ok(None) => format!("{} not found", key),
+                Ok(Some(value)) => format!("{:?} => {:?}", key, value),
+                Ok(None) => format!("{:?} not found", key),
                 Err(e) => format!("Failed to get key: {}", e),
             },
-            Command::Set { key, value } => match self.cache.set(&key, &value) {
-                Ok(_) => format!("{} => {}", key, value),
+            Command::Set { key, value } => match self.cache.set(key.as_slice(), value.as_slice()) {
+                Ok(_) => format!("{:?} => {:?}", key, value),
                 Err(e) => format!("Failed to set key to value: {}", e),
             },
             Command::Delete { key } => match self.cache.delete(&key) {
-                Ok(Some(_)) => format!("{} deleted", key),
-                Ok(None) => format!("{} not found", key),
+                Ok(Some(_)) => format!("{:?} deleted", key),
+                Ok(None) => format!("{:?} not found", key),
                 Err(e) => format!("Failed to delete key: {}", e),
             },
         };
