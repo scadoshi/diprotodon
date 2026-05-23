@@ -5,7 +5,7 @@ use crate::domain::{
     command::Command,
 };
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     net::TcpStream,
 };
 
@@ -21,13 +21,13 @@ pub enum ReplError {
 pub struct Session {
     id: u32,
     reader: BufReader<TcpStream>,
-    writer: TcpStream,
+    writer: BufWriter<TcpStream>,
     cache: Cache,
 }
 
 impl Session {
     pub fn new(id: u32, stream: TcpStream, cache: Cache) -> Result<Self, std::io::Error> {
-        let writer = stream.try_clone()?;
+        let writer = BufWriter::new(stream.try_clone()?);
         let reader = BufReader::new(stream);
         Ok(Self {
             id,
@@ -85,6 +85,7 @@ impl Session {
                 Ok(None) => format!("{:?} not found", key),
                 Err(e) => format!("Failed to delete key: {}", e),
             },
+            Command::Ping => "pong".to_string(),
         };
         response.push('\n');
         self.writer.write_all(response.as_bytes())?;

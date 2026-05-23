@@ -15,6 +15,7 @@ pub enum Command {
     Get { key: Vec<u8> },
     Set { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
+    Ping,
 }
 
 impl Command {
@@ -30,14 +31,15 @@ impl Command {
     pub fn delete(key: impl Into<Vec<u8>>) -> Self {
         Self::Delete { key: key.into() }
     }
-    pub fn key(&self) -> &[u8] {
+    pub fn key(&self) -> Option<&[u8]> {
         match self {
-            Self::Get { key } | Self::Set { key, .. } | Self::Delete { key } => key,
+            Self::Get { key } | Self::Set { key, .. } | Self::Delete { key } => Some(key),
+            Self::Ping => None,
         }
     }
     pub fn value(&self) -> Option<&[u8]> {
         match self {
-            Self::Get { .. } | Self::Delete { .. } => None,
+            Self::Get { .. } | Self::Delete { .. } | Self::Ping => None,
             Self::Set { value, .. } => Some(value),
         }
     }
@@ -73,6 +75,7 @@ impl TryFrom<&str> for Command {
                 }
                 Ok(Self::delete(key))
             }
+            "ping" => Ok(Self::Ping),
             _ => Err(CommandError::UnrecognizedCommand),
         }
     }
@@ -107,6 +110,11 @@ mod tests {
             Command::try_from("DEL key").unwrap(),
             Command::delete(b"key")
         );
+    }
+    #[test]
+    fn try_from_str_ok_ping() {
+        assert_eq!(Command::try_from("ping").unwrap(), Command::Ping);
+        assert_eq!(Command::try_from("PING").unwrap(), Command::Ping);
     }
     #[test]
     fn try_from_str_err_get_too_many_parts() {

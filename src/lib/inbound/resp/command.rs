@@ -59,6 +59,7 @@ impl TryFrom<Frame> for Command {
                         }
                         Ok(Self::delete(key))
                     }
+                    b"ping" => Ok(Self::Ping),
                     _ => Err(CommandError::UnrecognizedCommand.into()),
                 }
             }
