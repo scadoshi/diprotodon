@@ -29,6 +29,23 @@ impl SimpleInner {
     fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    pub fn ok() -> Self {
+        Self(b"OK".to_vec())
+    }
+
+    pub fn pong() -> Self {
+        Self(b"PONG".to_vec())
+    }
+
+    pub fn sanitized(bytes: impl Into<Vec<u8>>) -> Self {
+        let bytes = bytes
+            .into()
+            .into_iter()
+            .filter(|b| *b != b'\r' && *b != b'\n')
+            .collect();
+        Self(bytes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,7 +58,7 @@ pub enum Reply {
 }
 
 impl Reply {
-    fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
+    pub fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
         match self {
             Reply::SimpleString(inner) => {
                 w.write_all(b"+")?;
