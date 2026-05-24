@@ -21,7 +21,7 @@ pub enum CacheError {
     MutexPoisoned,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Cache {
     inner: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 }
