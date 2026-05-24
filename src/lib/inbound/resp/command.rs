@@ -60,6 +60,16 @@ impl TryFrom<Frame> for Command {
                         Ok(Self::delete(key))
                     }
                     b"ping" => Ok(Self::Ping),
+                    b"exists" => {
+                        let key = iter.next().ok_or(CommandError::NotEnoughParts)?;
+                        let Frame::BulkString(key) = key else {
+                            return Err(CommandFromFrameError::UnexpectedFrame);
+                        };
+                        if iter.next().is_some() {
+                            return Err(CommandError::TooManyParts.into());
+                        }
+                        Ok(Self::exists(key))
+                    }
                     _ => Err(CommandError::UnrecognizedCommand.into()),
                 }
             }
@@ -201,6 +211,47 @@ mod tests {
     fn try_from_value_err_del_not_enough_parts() {
         assert!(matches!(
             Command::try_from(Frame::Array(vec![Frame::BulkString(b"get".to_vec()),])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::NotEnoughParts
+            ))
+        ));
+    }
+    #[test]
+    fn try_from_value_ok_exists() {
+        assert_eq!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"exists".to_vec()),
+                Frame::BulkString(b"key".to_vec()),
+            ]))
+            .unwrap(),
+            Command::exists(b"key")
+        );
+        assert_eq!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"EXISTS".to_vec()),
+                Frame::BulkString(b"key".to_vec()),
+            ]))
+            .unwrap(),
+            Command::exists(b"key")
+        );
+    }
+    #[test]
+    fn try_from_value_err_exists_too_many_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"exists".to_vec()),
+                Frame::BulkString(b"key".to_vec()),
+                Frame::BulkString(b"key".to_vec()),
+            ])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::TooManyParts
+            ))
+        ));
+    }
+    #[test]
+    fn try_from_value_err_exists_not_enough_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![Frame::BulkString(b"exists".to_vec())])),
             Err(CommandFromFrameError::CommandError(
                 CommandError::NotEnoughParts
             ))

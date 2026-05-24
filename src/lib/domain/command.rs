@@ -16,6 +16,7 @@ pub enum Command {
     Set { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
     Ping,
+    Exists { key: Vec<u8> },
 }
 
 impl Command {
@@ -31,15 +32,21 @@ impl Command {
     pub fn delete(key: impl Into<Vec<u8>>) -> Self {
         Self::Delete { key: key.into() }
     }
+    pub fn exists(key: impl Into<Vec<u8>>) -> Self {
+        Self::Exists { key: key.into() }
+    }
     pub fn key(&self) -> Option<&[u8]> {
         match self {
-            Self::Get { key } | Self::Set { key, .. } | Self::Delete { key } => Some(key),
+            Self::Get { key }
+            | Self::Set { key, .. }
+            | Self::Delete { key }
+            | Self::Exists { key } => Some(key),
             Self::Ping => None,
         }
     }
     pub fn value(&self) -> Option<&[u8]> {
         match self {
-            Self::Get { .. } | Self::Delete { .. } | Self::Ping => None,
+            Self::Get { .. } | Self::Delete { .. } | Self::Ping | Self::Exists { .. } => None,
             Self::Set { value, .. } => Some(value),
         }
     }
@@ -81,6 +88,16 @@ mod tests {
     }
 
     #[test]
+    fn exists_constructor() {
+        assert_eq!(
+            Command::exists("key"),
+            Command::Exists {
+                key: b"key".to_vec()
+            }
+        );
+    }
+
+    #[test]
     fn key_get() {
         assert_eq!(Command::get("key").key(), Some(b"key".as_slice()));
     }
@@ -93,6 +110,11 @@ mod tests {
     #[test]
     fn key_delete() {
         assert_eq!(Command::delete("key").key(), Some(b"key".as_slice()));
+    }
+
+    #[test]
+    fn key_exists() {
+        assert_eq!(Command::exists("key").key(), Some(b"key".as_slice()));
     }
 
     #[test]
@@ -121,5 +143,10 @@ mod tests {
     #[test]
     fn value_ping() {
         assert_eq!(Command::Ping.value(), None);
+    }
+
+    #[test]
+    fn value_exists() {
+        assert_eq!(Command::exists("key").value(), None);
     }
 }

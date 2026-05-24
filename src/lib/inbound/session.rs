@@ -113,21 +113,20 @@ impl<R: Read, W: Write> Session<R, W> {
 
     pub fn execute(&mut self, command: Command) -> Result<(), CacheError> {
         let reply = match command {
-            Command::Get { key } => match self.cache.get(&key) {
-                Ok(Some(value)) => Reply::BulkString(value),
-                Ok(None) => Reply::NullBulk,
-                Err(e) => return Err(e),
-            },
-            Command::Set { key, value } => match self.cache.set(key.as_slice(), value.as_slice()) {
-                Ok(_) => Reply::SimpleString(SimpleInner::ok()),
-                Err(e) => return Err(e),
-            },
-            Command::Delete { key } => match self.cache.delete(&key) {
-                Ok(Some(_)) => Reply::Integer(1),
-                Ok(None) => Reply::Integer(0),
-                Err(e) => return Err(e),
-            },
+            Command::Get { key } => {
+                let value = self.cache.get(&key)?;
+                match value {
+                    Some(value) => Reply::BulkString(value),
+                    None => Reply::NullBulk,
+                }
+            }
+            Command::Set { key, value } => {
+                self.cache.set(key.as_slice(), value.as_slice())?;
+                Reply::SimpleString(SimpleInner::ok())
+            }
+            Command::Delete { key } => Reply::Integer(self.cache.delete(&key)?.is_some() as i64),
             Command::Ping => Reply::SimpleString(SimpleInner::pong()),
+            Command::Exists { key } => Reply::Integer(self.cache.exists(&key)? as i64),
         };
         reply.write_to(&mut self.writer)?;
         self.writer.flush()?;

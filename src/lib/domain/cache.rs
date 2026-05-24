@@ -46,6 +46,11 @@ impl Cache {
         Ok(guard.remove(key.as_ref()))
     }
 
+    pub fn exists(&self, key: impl AsRef<[u8]>) -> Result<bool, CacheError> {
+        let guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
+        Ok(guard.contains_key(key.as_ref()))
+    }
+
     pub fn init() -> Result<Self, CacheError> {
         let buf = match File::open(CACHE_PATH) {
             Ok(mut file) => {
