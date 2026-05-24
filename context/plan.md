@@ -72,7 +72,7 @@ Before AOF, close these test gaps:
 - **Async migration** — currently `std::thread` per connection. Tokio rewrite owed before M5 (broadcast fan-out wants async). Master plan assumes tokio from the start; doing it sync first was a deliberate detour to feel the threading model.
 - **Connection lifecycle on errors** — `get_command` writes errors back and `continue`s; on a broken stream this can hot-loop. Audit when wiring shutdown.
 - **`Session` vs `Cache` error types** — `ReplError` wraps both; the split has held up post-RESP, but worth revisiting once AOF lands.
-- **Cargo deps** — `tracing` / `tracing-subscriber` are in `Cargo.toml` but not yet wired into any code. Either wire them up (eprintln → tracing macros) or remove.
+- **Logging migration** — `tracing` / `tracing-subscriber` are in `Cargo.toml` as prep. Plan: replace the scattered `println!` / `eprintln!` calls in `server.rs` and `session.rs` with structured `tracing` events (`info!` for connection lifecycle, `warn!` for recoverable errors like bad commands, `error!` for session-fatal). Add a `tracing_subscriber::fmt()` init in `main.rs`. Worth doing before AOF so debugging the persist path has real structured logs to grep.
 
 ## Graceful shutdown plan
 
