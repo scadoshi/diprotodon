@@ -31,7 +31,7 @@ impl<R: Read> SessionReader<R> {
         }
     }
 
-    pub fn read(&mut self) -> Result<usize, std::io::Error> {
+    pub fn read(&mut self) -> std::io::Result<usize> {
         let mut new = [0u8; 1024];
         let len = self.inner.read(&mut new)?;
         self.buf.extend_from_slice(&new[..len]);
@@ -95,6 +95,7 @@ impl<R: Read, W: Write> Session<R, W> {
     pub fn get_command(&mut self) -> std::io::Result<Option<Command>> {
         loop {
             let frame = self.get_frame()?;
+
             match frame {
                 Some(frame) => match Command::try_from(frame) {
                     Ok(cmd) => return Ok(Some(cmd)),
@@ -145,5 +146,45 @@ impl<R: Read, W: Write> Session<R, W> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn session_reader_read() {
+        let mut reader = SessionReader::new(Cursor::new(Vec::from(b"foo")));
+        assert_eq!(reader.read().unwrap(), 3);
+        assert_eq!(reader.read().unwrap(), 0);
+    }
+
+    #[test]
+    fn session_reader_parse_frame_ok() {
+        let mut reader =
+            SessionReader::new(Cursor::new(Vec::from(b"$3\r\nfoo\r\n$3\r\nbar\r\nbaz")));
+        reader.read().unwrap();
+        reader.parse_frame().unwrap();
+        assert_eq!(reader.buf.len(), 12);
+        reader.parse_frame().unwrap();
+        assert_eq!(reader.buf.len(), 3);
+    }
+
+    #[test]
+    fn session_reader_parse_frame_incomplete_error_retains_buf() {
+        let mut reader = SessionReader::new(Cursor::new(Vec::from(b"foo")));
+        reader.read().unwrap();
+        let _ = reader.parse_frame();
+        assert_eq!(reader.buf.len(), 3);
+    }
+
+    #[test]
+    fn session_reader_parse_frame_non_incomplete_errors_clear_buf() {
+        let mut reader = SessionReader::new(Cursor::new(Vec::from(b"foo\r\nbar")));
+        reader.read().unwrap();
+        let _ = reader.parse_frame();
+        assert_eq!(reader.buf.len(), 0);
     }
 }
