@@ -16,8 +16,8 @@ impl Server {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 match persisting_cache.persist() {
-                    Ok(_) => println!("Cache persisted"),
-                    Err(e) => eprintln!("Failed to persist cache: {}", e),
+                    Ok(_) => println!("cache persisted"),
+                    Err(e) => eprintln!("failed to persist cache: {}", e),
                 }
             }
         });
@@ -26,15 +26,21 @@ impl Server {
                 connection_count += 1;
                 println!("client number {} connected", connection_count);
                 let cache_clone = cache.clone();
-                spawn(
-                    move || match Session::new(connection_count, stream, cache_clone) {
-                        Ok(mut session) => match session.repl() {
-                            Ok(_) => (),
-                            Err(e) => eprintln!("Failed to repl: {}", e),
-                        },
-                        Err(e) => eprintln!("Failed to create new session: {}", e),
-                    },
-                );
+                spawn(move || {
+                    let stream_clone = match stream.try_clone() {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            eprintln!("failed to clone stream: {}", e);
+                            return;
+                        }
+                    };
+                    let mut session =
+                        Session::new(connection_count, stream_clone, stream, cache_clone);
+                    match session.repl() {
+                        Ok(_) => (),
+                        Err(e) => eprintln!("failed to repl: {}", e),
+                    }
+                });
             }
         }
     }

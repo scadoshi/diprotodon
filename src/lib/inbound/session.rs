@@ -1,13 +1,13 @@
+use crate::{
+    domain::{
+        cache::{Cache, CacheError},
+        command::Command,
+    },
+    inbound::resp::frame::{Frame, FrameError},
+    outbound::resp::reply::{Reply, SimpleInner},
+};
+use std::io::{BufReader, BufWriter, Read, Write};
 use thiserror::Error;
-
-use crate::domain::{
-    cache::{Cache, CacheError},
-    command::Command,
-};
-use std::{
-    io::{BufRead, BufReader, BufWriter, Write},
-    net::TcpStream,
-};
 
 #[derive(Debug, Error)]
 pub enum ReplError {
@@ -18,100 +18,129 @@ pub enum ReplError {
 }
 
 #[derive(Debug)]
-pub struct Session {
+pub struct SessionReader<R: Read> {
+    inner: BufReader<R>,
+    buf: Vec<u8>,
+}
+
+impl<R: Read> SessionReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: BufReader::new(reader),
+            buf: Vec::new(),
+        }
+    }
+
+    pub fn read(&mut self) -> Result<usize, std::io::Error> {
+        let mut new = [0u8; 1024];
+        let len = self.inner.read(&mut new)?;
+        self.buf.extend_from_slice(&new[..len]);
+        Ok(len)
+    }
+
+    pub fn parse_frame(&mut self) -> Result<Frame, FrameError> {
+        match Frame::parse_one(&self.buf) {
+            Ok((frame, bytes)) => {
+                let consumed = self.buf.len() - bytes.len();
+                self.buf.drain(..consumed);
+                Ok(frame)
+            }
+            Err(e) => {
+                if !matches!(e, FrameError::Incomplete) {
+                    self.buf.clear();
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Session<R: Read, W: Write> {
     id: u32,
-    reader: BufReader<TcpStream>,
-    writer: BufWriter<TcpStream>,
+    reader: SessionReader<R>,
+    writer: BufWriter<W>,
     cache: Cache,
 }
 
-impl Session {
-    pub fn new(id: u32, stream: TcpStream, cache: Cache) -> Result<Self, std::io::Error> {
-        let writer = BufWriter::new(stream.try_clone()?);
-        let reader = BufReader::new(stream);
-        Ok(Self {
+impl<R: Read, W: Write> Session<R, W> {
+    pub fn new(id: u32, reader: R, writer: W, cache: Cache) -> Self {
+        let writer = BufWriter::new(writer);
+        let reader = SessionReader::new(reader);
+        Self {
             id,
             reader,
             writer,
             cache,
-        })
-    }
-
-    pub fn get_message(&mut self) -> Result<Option<String>, std::io::Error> {
-        let mut input = String::new();
-        match self.reader.read_line(&mut input) {
-            Ok(0) => Ok(None),
-            Ok(_) => Ok(Some(input)),
-            Err(e) => Err(e),
         }
     }
 
-    pub fn get_command(&mut self) -> Result<Option<Command>, std::io::Error> {
+    pub fn get_frame(&mut self) -> std::io::Result<Option<Frame>> {
         loop {
-            match self.get_message() {
-                Ok(Some(message)) => match Command::try_from(message.as_str()) {
-                    Ok(command) => return Ok(Some(command)),
+            self.reader.read()?;
+            match self.reader.parse_frame() {
+                Ok(frame) => return Ok(Some(frame)),
+                Err(e) => {
+                    if !matches!(e, FrameError::Incomplete) {
+                        Reply::SimpleError(SimpleInner::sanitized(format!("ERR {}", e)))
+                            .write_to(&mut self.writer)?;
+                    }
+                    self.writer.flush()?;
+                    continue;
+                }
+            }
+        }
+    }
+
+    pub fn get_command(&mut self) -> std::io::Result<Option<Command>> {
+        loop {
+            let frame = self.get_frame()?;
+            match frame {
+                Some(frame) => match Command::try_from(frame) {
+                    Ok(cmd) => return Ok(Some(cmd)),
                     Err(e) => {
-                        self.writer
-                            .write_all(format!("Failed to parse command: {}\n", e).as_bytes())?;
+                        Reply::SimpleError(SimpleInner::sanitized(format!("ERR {}", e)))
+                            .write_to(&mut self.writer)?;
                         self.writer.flush()?;
                         continue;
                     }
                 },
-                Err(e) => {
-                    self.writer
-                        .write_all(format!("Failed to get message: {}\n", e).as_bytes())?;
-                    self.writer.flush()?;
-                    continue;
-                }
-                Ok(None) => return Ok(None),
+                None => return Ok(None),
             };
         }
     }
 
     pub fn execute(&mut self, command: Command) -> Result<(), CacheError> {
-        let mut response = match command {
+        let reply = match command {
             Command::Get { key } => match self.cache.get(&key) {
-                Ok(Some(value)) => format!("{:?} => {:?}", key, value),
-                Ok(None) => format!("{:?} not found", key),
-                Err(e) => format!("Failed to get key: {}", e),
+                Ok(Some(value)) => Reply::BulkString(value),
+                Ok(None) => Reply::NullBulk,
+                Err(e) => return Err(e),
             },
             Command::Set { key, value } => match self.cache.set(key.as_slice(), value.as_slice()) {
-                Ok(_) => format!("{:?} => {:?}", key, value),
-                Err(e) => format!("Failed to set key to value: {}", e),
+                Ok(_) => Reply::SimpleString(SimpleInner::ok()),
+                Err(e) => return Err(e),
             },
             Command::Delete { key } => match self.cache.delete(&key) {
-                Ok(Some(_)) => format!("{:?} deleted", key),
-                Ok(None) => format!("{:?} not found", key),
-                Err(e) => format!("Failed to delete key: {}", e),
+                Ok(Some(_)) => Reply::Integer(1),
+                Ok(None) => Reply::Integer(0),
+                Err(e) => return Err(e),
             },
-            Command::Ping => "pong".to_string(),
+            Command::Ping => Reply::SimpleString(SimpleInner::pong()),
         };
-        response.push('\n');
-        self.writer.write_all(response.as_bytes())?;
+        reply.write_to(&mut self.writer)?;
         self.writer.flush()?;
         Ok(())
     }
 
     pub fn repl(&mut self) -> Result<(), ReplError> {
         loop {
-            match self.get_command() {
-                Ok(Some(command)) => match self.execute(command) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        self.writer
-                            .write_all(format!("Failed execute command: {}", e).as_bytes())?;
-                        continue;
-                    }
-                },
-                Ok(None) => {
-                    println!("Client {} disconnected", self.id);
+            let cmd = self.get_command()?;
+            match cmd {
+                Some(cmd) => self.execute(cmd)?,
+                None => {
+                    println!("client {} disconnected", self.id);
                     break;
-                }
-                Err(e) => {
-                    self.writer
-                        .write_all(format!("Failed get command: {}", e).as_bytes())?;
-                    continue;
                 }
             }
         }
