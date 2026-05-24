@@ -14,9 +14,9 @@ pub enum CacheError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    ReadError(#[from] ReadError),
+    Read(#[from] ReadError),
     #[error(transparent)]
-    WriteError(#[from] WriteError),
+    Write(#[from] WriteError),
     #[error("cache mutex poisoned")]
     MutexPoisoned,
 }
