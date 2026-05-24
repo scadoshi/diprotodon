@@ -1,6 +1,6 @@
 # diprotodon — Progress
 
-Lifted from the master study plan at `~/Work/appetizers/ideas/redis-mini-study-plan.md`. This file tracks where the project actually is; the master plan owns the broader interview-prep trajectory.
+This file tracks where the project actually is — milestone status, decisions made, gotchas surfaced, and what's next.
 
 ## Where I am
 
@@ -10,7 +10,7 @@ Lifted from the master study plan at `~/Work/appetizers/ideas/redis-mini-study-p
 
 **M2 essentially complete.** EXISTS added end-to-end in ~14 minutes (validation that the layered architecture extends mechanically). GET/SET/DEL/EXISTS all working.
 
-**Strategic phase shift.** From here forward, work is allocated by *novelty-to-Scotty*, not by milestone order. The user has already shipped LSM-style persistence (WAL + memtable + SSTable + compaction + bloom filters) in `~/Projects/nighthawk`. That makes append-only-log mechanics rehearsed muscle — AI-assisted is fine. The unrehearsed pieces (TTL active sweep, pub/sub fan-out, async migration, graceful shutdown design) get hand-written.
+**Strategic phase shift.** From here forward, work is allocated by *what's novel vs. what's rehearsed*, not by milestone order. The user has already shipped LSM-style persistence (WAL + memtable + SSTable + compaction + bloom filters) in `~/Projects/nighthawk`. That makes append-only-log mechanics rehearsed muscle — AI-assisted is fine. The unrehearsed pieces (TTL active sweep, pub/sub fan-out, async migration, graceful shutdown design) get hand-written.
 
 ## Testing next up
 
@@ -72,7 +72,7 @@ Before AOF, close these test gaps:
 ## Cross-cutting work owed
 
 - **Graceful shutdown** — Ctrl-C kills mid-loop, last writes lost. Plan below.
-- **Async migration** — currently `std::thread` per connection. Tokio rewrite owed before M5 (broadcast fan-out wants async). Master plan assumes tokio from the start; doing it sync first was a deliberate detour to feel the threading model.
+- **Async migration** — currently `std::thread` per connection. Tokio rewrite owed before M5 (broadcast fan-out wants async). Doing it sync first was a deliberate detour to feel the threading model before async hides it.
 - **Connection lifecycle on errors** — `get_command` writes errors back and `continue`s; on a broken stream this can hot-loop. Audit when wiring shutdown.
 - **`Session` vs `Cache` error types** — `ReplError` wraps both; the split has held up post-RESP, but worth revisiting once AOF lands.
 - **Logging migration** — `tracing` / `tracing-subscriber` are in `Cargo.toml` as prep. Plan: replace the scattered `println!` / `eprintln!` calls in `server.rs` and `session.rs` with structured `tracing` events (`info!` for connection lifecycle, `warn!` for recoverable errors like bad commands, `error!` for session-fatal). Add a `tracing_subscriber::fmt()` init in `main.rs`. Worth doing before AOF so debugging the persist path has real structured logs to grep.
@@ -107,10 +107,10 @@ This is the strategic split going forward. The user has already shipped LSM pers
 
 ### Worth hand-writing (novel muscle)
 
-- **TTL / EXPIRE / active sweep (M3)** — densest novel-concept surface left. Lazy expiration on read is trivial; the active background sweep is where the design choices live: sampling strategy (random N keys vs. shard-walking), expiry index shape (per-key timestamp in the value vs. separate priority queue vs. expiration buckets), what fraction of expired keys to evict per pass, how to avoid blocking writers. Nighthawk does not touch this. Real interview talk-track material. **Do this first.**
-- **AOF rewrite/compaction design** — the *consistent-snapshot-without-blocking-writers* problem is novel. Sketch the algorithm by hand (fork+COW vs. clone-the-HashMap vs. copy-on-write structures, how to buffer concurrent writes during rewrite, atomic swap at the end) before writing code. The talk-track is the snapshot strategy, not the file mechanics.
+- **TTL / EXPIRE / active sweep (M3)** — densest novel-concept surface left. Lazy expiration on read is trivial; the active background sweep is where the design choices live: sampling strategy (random N keys vs. shard-walking), expiry index shape (per-key timestamp in the value vs. separate priority queue vs. expiration buckets), what fraction of expired keys to evict per pass, how to avoid blocking writers. Nighthawk does not touch this. **Do this first.**
+- **AOF rewrite/compaction design** — the *consistent-snapshot-without-blocking-writers* problem is novel. Sketch the algorithm by hand (fork+COW vs. clone-the-HashMap vs. copy-on-write structures, how to buffer concurrent writes during rewrite, atomic swap at the end) before writing code. The snapshot strategy is the interesting bit; file mechanics are mechanical.
 - **Graceful shutdown** — small but the blocking-`accept()` escape is interesting: non-blocking + poll vs. shutdown-socket trick vs. set_nonblocking. AtomicBool vs. proper cancellation. Drain-vs-kill in-flight connections.
-- **Async/tokio migration** — paradigm shift, not a feature. The "I rewrote sync→async deliberately" story is real talk-track. Hand-write to feel the model.
+- **Async/tokio migration** — paradigm shift, not a feature. Hand-write to feel the model and to have the lived sync→async rewrite experience.
 - **Pub/Sub fan-out (M5)** — different concurrency shape than request/response. mpsc-per-subscriber vs. broadcast tradeoffs, slow-subscriber handling, subscription registry under contention. Easier after async lands (tokio broadcast > std::sync::mpsc fan-out).
 
 ### AI-jet (rehearsed in nighthawk or mechanical extension)
@@ -121,16 +121,16 @@ This is the strategic split going forward. The user has already shipped LSM pers
 - **More commands** — INCR, DECR, MGET, APPEND, STRLEN. Proven extensible in <14 minutes per command.
 - **Logging migration** — `tracing` macros replacing `println!`/`eprintln!`. Pure mechanical.
 - **Test gap closure** — Cache unit tests, end-to-end repl tests with scripted RESP bytes. Rote.
-- **README + anonymization for portfolio** — writing, not engineering.
+- **README updates** — writing, not engineering.
 
 ### Strategic order
 
-1. **EXPIRE/TTL by hand** (M3) — densest novel-concept density, smallest blast radius
-2. **AOF design by hand, AI scaffolds the code** (M4) — durability talk-track, fork-vs-clone snapshot discussion
-3. **Graceful shutdown by hand** — finishes "production thinking" story, sets up async cleanly
-4. **Async/tokio migration by hand** — paradigm shift, rewrite story
+1. **EXPIRE/TTL by hand** (M3) — densest novel-concept surface, smallest blast radius
+2. **AOF design by hand, AI scaffolds the code** (M4) — durability story, fork-vs-clone snapshot decision
+3. **Graceful shutdown by hand** — production-thinking story, sets up async cleanly
+4. **Async/tokio migration by hand** — paradigm shift, rewrite experience
 5. **Pub/Sub by hand** (M5) — easier post-async
-6. AI sweeps in between or after: more commands, tracing migration, test gap closure, portfolio README + anonymization
+6. AI sweeps in between or after: more commands, tracing migration, test gap closure, README updates
 
 ## Discipline note
 

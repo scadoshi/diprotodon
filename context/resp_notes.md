@@ -39,7 +39,7 @@ A Redis server speaking GET / SET / DEL only ever needs to handle a narrow slice
 - Integer — `:1\r\n` for DEL count (and EXISTS later)
 - Simple error — `-ERR ...\r\n`
 
-RESP3 types (Map, Set, Push, Attribute, BigNumber, VerbatimString, Boolean, Double, BulkError) are out of scope. A real interviewer accepts "I scoped to RESP2 bulk-string arrays because that's what real clients send" — they will not accept an untested VerbatimString implementation.
+RESP3 types (Map, Set, Push, Attribute, BigNumber, VerbatimString, Boolean, Double, BulkError) are out of scope. Scoped to RESP2 bulk-string arrays because that's what real clients send — adding untested RESP3 surface would be a footgun.
 
 Inline commands (telnet-style `PING\r\n` without RESP framing) are also out of scope. Reject anything that doesn't start with `*` as `-ERR`.
 
@@ -105,7 +105,7 @@ bytes -> RespValue -> Command
 - `Command` knows nothing about `\r\n`. Just domain.
 - Serializer is the inverse: `Reply -> bytes`. `RespValue` is reusable for the reply side (you'll need to *write* RESP, not just read it).
 
-Easier to test each layer in isolation. Easier to talk about in an interview ("I separated framing from semantics so the parser doesn't need to learn new commands when I add EXISTS").
+Easier to test each layer in isolation. The parser doesn't need to learn new commands when you add EXISTS — `Frame` knows nothing about Redis semantics.
 
 ## Implementation decisions (running log)
 
@@ -146,7 +146,7 @@ std::str::from_utf8(&sigil_len_str[1..])?.parse::<usize>()?
 
 `from_utf8` returns `&str` — a view over the existing bytes, no allocation. `.parse::<usize>()` consumes the `&str`. Two error types collapsed into one `ParseLengthError` enum (`Utf8` + `ParseInt`) with `#[from]` conversions so `?` works.
 
-Could roll a digit-by-digit accumulator (`n = n*10 + (b - b'0') as usize`) and skip the validation entirely — more interview-flex, shows what `parse` does under the hood. Not done yet, but on the table.
+Could roll a digit-by-digit accumulator (`n = n*10 + (b - b'0') as usize`) and skip the validation entirely — shows what `parse` does under the hood, and avoids the UTF-8 check on bytes we already know are ASCII digits. Not done yet, but on the table.
 
 ### `parse_bulk_string(bytes, len)`
 

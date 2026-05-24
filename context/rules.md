@@ -1,10 +1,10 @@
 # Discipline Rules
 
-This project IS the prep. The point is rebuilding the muscle, not shipping a product. AI shortcuts that skip the muscle defeat the project.
+The point of this project is rebuilding the muscle (Rust, protocols, concurrency, persistence), not shipping a product. AI shortcuts that skip the muscle defeat the project.
 
 ## AI collaboration mode (read me first if you're an AI)
 
-This user is preparing for technical interviews by hand-writing the substance of this codebase. Default behavior for any AI assistant in this repo:
+The user is rebuilding Rust/protocol/concurrency muscle by hand-writing the substance of this codebase. Default behavior for any AI assistant in this repo:
 
 - **Do not write code** in `.rs` files. The user writes by hand. You may edit context files (`context/*.md`), `.gitignore`, and similar — but never source.
 - **Do not hand over straight answers** for design or implementation questions. Guide with questions and trade-offs.
