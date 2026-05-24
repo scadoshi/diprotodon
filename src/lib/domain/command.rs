@@ -45,128 +45,81 @@ impl Command {
     }
 }
 
-impl TryFrom<&str> for Command {
-    type Error = CommandError;
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let mut iter = value.split_whitespace();
-        let cmd = iter.next().ok_or(CommandError::NotEnoughParts)?;
-        let cmd = cmd.to_lowercase();
-        match cmd.as_str() {
-            "get" => {
-                let key = iter.next().ok_or(CommandError::NotEnoughParts)?;
-                if iter.next().is_some() {
-                    return Err(CommandError::TooManyParts);
-                }
-                Ok(Self::get(key))
-            }
-            "set" => {
-                let (Some(key), Some(value)) = (iter.next(), iter.next()) else {
-                    return Err(CommandError::NotEnoughParts);
-                };
-                if iter.next().is_some() {
-                    return Err(CommandError::TooManyParts);
-                }
-                Ok(Self::set(key, value))
-            }
-            "del" => {
-                let key = iter.next().ok_or(CommandError::NotEnoughParts)?;
-                if iter.next().is_some() {
-                    return Err(CommandError::TooManyParts);
-                }
-                Ok(Self::delete(key))
-            }
-            "ping" => Ok(Self::Ping),
-            _ => Err(CommandError::UnrecognizedCommand),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn try_from_str_ok_get() {
-        assert_eq!(Command::try_from("get key").unwrap(), Command::get(b"key"));
-        assert_eq!(Command::try_from("GET key").unwrap(), Command::get(b"key"));
-    }
-    #[test]
-    fn try_from_str_ok_set() {
+    fn get_constructor() {
         assert_eq!(
-            Command::try_from("set key value").unwrap(),
-            Command::set(b"key", b"value")
-        );
-        assert_eq!(
-            Command::try_from("SET key value").unwrap(),
-            Command::set(b"key", b"value")
+            Command::get("key"),
+            Command::Get {
+                key: b"key".to_vec()
+            }
         );
     }
+
     #[test]
-    fn try_from_str_ok_del() {
+    fn set_constructor() {
         assert_eq!(
-            Command::try_from("del key").unwrap(),
-            Command::delete(b"key")
+            Command::set("key", "value"),
+            Command::Set {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+            }
         );
+    }
+
+    #[test]
+    fn delete_constructor() {
         assert_eq!(
-            Command::try_from("DEL key").unwrap(),
-            Command::delete(b"key")
+            Command::delete("key"),
+            Command::Delete {
+                key: b"key".to_vec()
+            }
         );
     }
+
     #[test]
-    fn try_from_str_ok_ping() {
-        assert_eq!(Command::try_from("ping").unwrap(), Command::Ping);
-        assert_eq!(Command::try_from("PING").unwrap(), Command::Ping);
+    fn key_get() {
+        assert_eq!(Command::get("key").key(), Some(b"key".as_slice()));
     }
+
     #[test]
-    fn try_from_str_err_get_too_many_parts() {
-        assert!(matches!(
-            Command::try_from("get key key"),
-            Err(CommandError::TooManyParts)
-        ));
+    fn key_set() {
+        assert_eq!(Command::set("key", "value").key(), Some(b"key".as_slice()));
     }
+
     #[test]
-    fn try_from_str_err_set_too_many_parts() {
-        assert!(matches!(
-            Command::try_from("set key value value"),
-            Err(CommandError::TooManyParts)
-        ));
+    fn key_delete() {
+        assert_eq!(Command::delete("key").key(), Some(b"key".as_slice()));
     }
+
     #[test]
-    fn try_from_str_err_del_too_many_parts() {
-        assert!(matches!(
-            Command::try_from("del key key"),
-            Err(CommandError::TooManyParts)
-        ));
+    fn key_ping() {
+        assert_eq!(Command::Ping.key(), None);
     }
+
     #[test]
-    fn try_from_str_err_get_not_enough_parts() {
-        assert!(matches!(
-            Command::try_from("get"),
-            Err(CommandError::NotEnoughParts)
-        ));
+    fn value_get() {
+        assert_eq!(Command::get("key").value(), None);
     }
+
     #[test]
-    fn try_from_str_err_set_not_enough_parts() {
-        assert!(matches!(
-            Command::try_from("set key"),
-            Err(CommandError::NotEnoughParts)
-        ));
-        assert!(matches!(
-            Command::try_from("set"),
-            Err(CommandError::NotEnoughParts)
-        ));
+    fn value_set() {
+        assert_eq!(
+            Command::set("key", "value").value(),
+            Some(b"value".as_slice())
+        );
     }
+
     #[test]
-    fn try_from_str_err_del_not_enough_parts() {
-        assert!(matches!(
-            Command::try_from("del"),
-            Err(CommandError::NotEnoughParts)
-        ));
+    fn value_delete() {
+        assert_eq!(Command::delete("key").value(), None);
     }
+
     #[test]
-    fn try_from_str_err_unrecognized_command() {
-        assert!(matches!(
-            Command::try_from("foo"),
-            Err(CommandError::UnrecognizedCommand)
-        ));
+    fn value_ping() {
+        assert_eq!(Command::Ping.value(), None);
     }
 }
