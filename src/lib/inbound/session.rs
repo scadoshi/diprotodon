@@ -6,7 +6,13 @@ use crate::{
     inbound::resp::frame::{Frame, FrameError},
     outbound::resp::reply::{Reply, SimpleInner},
 };
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::{
+    io::{BufReader, BufWriter, Read, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -133,7 +139,7 @@ impl<R: Read, W: Write> Session<R, W> {
         Ok(())
     }
 
-    pub fn repl(&mut self) -> Result<(), ReplError> {
+    pub fn repl(&mut self, shutdown_signal: Arc<AtomicBool>) -> Result<(), ReplError> {
         loop {
             let cmd = self.get_command()?;
             match cmd {
@@ -142,6 +148,9 @@ impl<R: Read, W: Write> Session<R, W> {
                     println!("client {} disconnected", self.id);
                     break;
                 }
+            }
+            if shutdown_signal.load(Ordering::Relaxed) {
+                break;
             }
         }
         Ok(())

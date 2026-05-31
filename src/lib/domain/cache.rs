@@ -72,9 +72,12 @@ impl Cache {
     }
 
     pub fn persist(&self) -> Result<(), CacheError> {
-        let guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
-        let bytes = wincode::serialize(&*guard)?;
-        drop(guard);
+        let data = self
+            .inner
+            .lock()
+            .map_err(|_| CacheError::MutexPoisoned)?
+            .to_owned();
+        let bytes = wincode::serialize(&data)?;
         let mut file = OpenOptions::new()
             .write(true)
             .truncate(true)
