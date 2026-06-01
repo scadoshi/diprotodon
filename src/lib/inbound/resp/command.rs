@@ -140,6 +140,9 @@ impl TryFrom<Frame> for Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- ok cases ----------
+
     #[test]
     fn try_from_frame_ok_get() {
         assert_eq!(
@@ -330,52 +333,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn try_from_frame_err_get_too_many_parts() {
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![
-                Frame::BulkString(b"get".to_vec()),
-                Frame::BulkString(b"foo".to_vec()),
-                Frame::BulkString(b"foo".to_vec()),
-            ])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::TooManyParts
-            ))
-        ));
-    }
-    #[test]
-    fn try_from_frame_err_set_too_many_parts() {
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![
-                Frame::BulkString(b"set".to_vec()),
-                Frame::BulkString(b"foo".to_vec()),
-                Frame::BulkString(b"value".to_vec()),
-                Frame::BulkString(b"value".to_vec()),
-            ])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::TooManyParts
-            ))
-        ));
-    }
+    // ---------- top-level shape errors ----------
 
     #[test]
-    fn try_from_frame_err_del_too_many_parts() {
+    fn try_from_frame_err_empty_array() {
         assert!(matches!(
-            Command::try_from(Frame::Array(vec![
-                Frame::BulkString(b"del".to_vec()),
-                Frame::BulkString(b"foo".to_vec()),
-                Frame::BulkString(b"foo".to_vec()),
-            ])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::TooManyParts
-            ))
-        ));
-    }
-
-    #[test]
-    fn try_from_frame_err_get_not_enough_parts() {
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![Frame::BulkString(b"get".to_vec()),])),
+            Command::try_from(Frame::Array(vec![])),
             Err(CommandFromFrameError::CommandError(
                 CommandError::NotEnoughParts
             ))
@@ -383,55 +346,12 @@ mod tests {
     }
 
     #[test]
-    fn try_from_frame_err_set_not_enough_parts() {
+    fn try_from_frame_err_command_value_is_array() {
         assert!(matches!(
-            Command::try_from(Frame::Array(vec![Frame::BulkString(b"set".to_vec()),])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::NotEnoughParts
-            ))
-        ));
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![
-                Frame::BulkString(b"set".to_vec()),
-                Frame::BulkString(b"foo".to_vec()),
-            ])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::NotEnoughParts
-            ))
-        ));
-    }
-
-    #[test]
-    fn try_from_frame_err_del_not_enough_parts() {
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![Frame::BulkString(b"del".to_vec()),])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::NotEnoughParts
-            ))
-        ));
-    }
-
-    #[test]
-    fn try_from_frame_err_exists_too_many_parts() {
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![
-                Frame::BulkString(b"exists".to_vec()),
-                Frame::BulkString(b"foo".to_vec()),
-                Frame::BulkString(b"foo".to_vec()),
-            ])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::TooManyParts
-            ))
-        ));
-    }
-
-    #[test]
-    fn try_from_frame_err_exists_not_enough_parts() {
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![Frame::BulkString(b"exists".to_vec())])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::NotEnoughParts
-            ))
+            Command::try_from(Frame::Array(vec![Frame::Array(vec![Frame::BulkString(
+                b"get".to_vec()
+            )])])),
+            Err(CommandFromFrameError::UnexpectedFrame)
         ));
     }
 
@@ -460,29 +380,31 @@ mod tests {
         ));
     }
 
-    // Top-level shape errors
+    // ---------- GET — errors ----------
 
     #[test]
-    fn try_from_frame_err_empty_array() {
+    fn try_from_frame_err_get_too_many_parts() {
         assert!(matches!(
-            Command::try_from(Frame::Array(vec![])),
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"get".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+            ])),
             Err(CommandFromFrameError::CommandError(
-                CommandError::NotEnoughParts
+                CommandError::TooManyParts
             ))
         ));
     }
 
     #[test]
-    fn try_from_frame_err_command_value_is_array() {
+    fn try_from_frame_err_get_not_enough_parts() {
         assert!(matches!(
-            Command::try_from(Frame::Array(vec![Frame::Array(vec![Frame::BulkString(
-                b"get".to_vec()
-            )])])),
-            Err(CommandFromFrameError::UnexpectedFrame)
+            Command::try_from(Frame::Array(vec![Frame::BulkString(b"get".to_vec()),])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::NotEnoughParts
+            ))
         ));
     }
-
-    // GET — unexpected frame for key
 
     #[test]
     fn try_from_frame_err_get_unexpected_frame_key() {
@@ -495,7 +417,41 @@ mod tests {
         ));
     }
 
-    // SET — unexpected frames
+    // ---------- SET — errors ----------
+
+    #[test]
+    fn try_from_frame_err_set_too_many_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"set".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+                Frame::BulkString(b"value".to_vec()),
+                Frame::BulkString(b"value".to_vec()),
+            ])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::TooManyParts
+            ))
+        ));
+    }
+
+    #[test]
+    fn try_from_frame_err_set_not_enough_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![Frame::BulkString(b"set".to_vec()),])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::NotEnoughParts
+            ))
+        ));
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"set".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+            ])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::NotEnoughParts
+            ))
+        ));
+    }
 
     #[test]
     fn try_from_frame_err_set_unexpected_frame_key() {
@@ -521,7 +477,31 @@ mod tests {
         ));
     }
 
-    // DEL — unexpected frame
+    // ---------- DEL — errors ----------
+
+    #[test]
+    fn try_from_frame_err_del_too_many_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"del".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+            ])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::TooManyParts
+            ))
+        ));
+    }
+
+    #[test]
+    fn try_from_frame_err_del_not_enough_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![Frame::BulkString(b"del".to_vec()),])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::NotEnoughParts
+            ))
+        ));
+    }
 
     #[test]
     fn try_from_frame_err_del_unexpected_frame_key() {
@@ -534,7 +514,31 @@ mod tests {
         ));
     }
 
-    // EXISTS — unexpected frame
+    // ---------- EXISTS — errors ----------
+
+    #[test]
+    fn try_from_frame_err_exists_too_many_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"exists".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+            ])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::TooManyParts
+            ))
+        ));
+    }
+
+    #[test]
+    fn try_from_frame_err_exists_not_enough_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![Frame::BulkString(b"exists".to_vec())])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::NotEnoughParts
+            ))
+        ));
+    }
 
     #[test]
     fn try_from_frame_err_exists_unexpected_frame_key() {
@@ -547,7 +551,34 @@ mod tests {
         ));
     }
 
-    // EXPIRE — every error path
+    // ---------- PING — errors ----------
+
+    #[test]
+    fn try_from_frame_err_ping_too_many_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"ping".to_vec()),
+                Frame::BulkString(b"hello".to_vec()),
+                Frame::BulkString(b"world".to_vec()),
+            ])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::TooManyParts
+            ))
+        ));
+    }
+
+    #[test]
+    fn try_from_frame_err_ping_unexpected_frame_message() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"ping".to_vec()),
+                Frame::Array(vec![]),
+            ])),
+            Err(CommandFromFrameError::UnexpectedFrame)
+        ));
+    }
+
+    // ---------- EXPIRE — errors ----------
 
     #[test]
     fn try_from_frame_err_expire_not_enough_parts_zero_args() {
@@ -636,7 +667,7 @@ mod tests {
         ));
     }
 
-    // EXPIREAT — every error path
+    // ---------- EXPIREAT — errors ----------
 
     #[test]
     fn try_from_frame_err_expireat_not_enough_parts_zero_args() {
@@ -725,17 +756,7 @@ mod tests {
         ));
     }
 
-    // TTL — every error path
-
-    #[test]
-    fn try_from_frame_err_ttl_not_enough_parts() {
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![Frame::BulkString(b"ttl".to_vec())])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::NotEnoughParts
-            ))
-        ));
-    }
+    // ---------- TTL — errors ----------
 
     #[test]
     fn try_from_frame_err_ttl_too_many_parts() {
@@ -752,6 +773,16 @@ mod tests {
     }
 
     #[test]
+    fn try_from_frame_err_ttl_not_enough_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![Frame::BulkString(b"ttl".to_vec())])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::NotEnoughParts
+            ))
+        ));
+    }
+
+    #[test]
     fn try_from_frame_err_ttl_unexpected_frame_key() {
         assert!(matches!(
             Command::try_from(Frame::Array(vec![
@@ -762,44 +793,7 @@ mod tests {
         ));
     }
 
-    // PING — every error path
-
-    #[test]
-    fn try_from_frame_err_ping_too_many_parts() {
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![
-                Frame::BulkString(b"ping".to_vec()),
-                Frame::BulkString(b"hello".to_vec()),
-                Frame::BulkString(b"world".to_vec()),
-            ])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::TooManyParts
-            ))
-        ));
-    }
-
-    #[test]
-    fn try_from_frame_err_ping_unexpected_frame_message() {
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![
-                Frame::BulkString(b"ping".to_vec()),
-                Frame::Array(vec![]),
-            ])),
-            Err(CommandFromFrameError::UnexpectedFrame)
-        ));
-    }
-
-    // PERSIST — every error path
-
-    #[test]
-    fn try_from_frame_err_persist_not_enough_parts() {
-        assert!(matches!(
-            Command::try_from(Frame::Array(vec![Frame::BulkString(b"persist".to_vec())])),
-            Err(CommandFromFrameError::CommandError(
-                CommandError::NotEnoughParts
-            ))
-        ));
-    }
+    // ---------- PERSIST — errors ----------
 
     #[test]
     fn try_from_frame_err_persist_too_many_parts() {
@@ -811,6 +805,16 @@ mod tests {
             ])),
             Err(CommandFromFrameError::CommandError(
                 CommandError::TooManyParts
+            ))
+        ));
+    }
+
+    #[test]
+    fn try_from_frame_err_persist_not_enough_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![Frame::BulkString(b"persist".to_vec())])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::NotEnoughParts
             ))
         ));
     }
