@@ -1,38 +1,80 @@
+//! Domain command type — the parsed, validated representation of a client request.
+//!
+//! [`Command`] is the boundary between the wire/RESP layer and the cache. RESP frames are
+//! parsed into a `Command` in `inbound::resp::command`; `inbound::session::execute` then
+//! dispatches on the variant to drive `Cache`. The enum is wire-agnostic: it carries
+//! exactly the data each operation needs and nothing about how it arrived.
+
 use std::{num::ParseIntError, str::Utf8Error};
 use thiserror::Error;
 
+/// Errors produced while building a [`Command`] from already-parsed RESP frames.
+///
+/// These are *semantic* errors (the frames parsed fine but the contents are wrong for
+/// the requested command). Frame-shape errors live one layer below in `FrameError`.
 #[derive(Error, Debug)]
 pub enum CommandError {
+    /// First bulk string didn't match any known command verb (e.g. `b"foo"`).
     #[error("unrecognized command")]
     UnrecognizedCommand,
+    /// Command requires more arguments than were supplied (e.g. `GET` with no key).
     #[error("not enough parts")]
     NotEnoughParts,
+    /// Command got more arguments than it accepts (e.g. `GET foo bar`).
     #[error("too many parts")]
     TooManyParts,
+    /// A numeric argument's bytes weren't valid UTF-8 (e.g. `EXPIRE foo <binary>`).
     #[error(transparent)]
     Utf8(#[from] Utf8Error),
+    /// A numeric argument was valid UTF-8 but didn't parse as the required integer
+    /// type (non-digits, negative for `u64`, overflow, etc.).
     #[error(transparent)]
     ParseInt(#[from] ParseIntError),
 }
 
+/// A validated client command, ready to be executed against the cache.
+///
+/// Variants are one-to-one with the RESP commands the server understands. Keys and
+/// values are `Vec<u8>` (not `String`) so the server stays binary-safe — bulk strings on
+/// the wire can be arbitrary bytes.
+///
+/// Construct via the lowercase helper methods (`Command::get`, `Command::set`, …) or
+/// by destructuring/pattern-matching the variants directly.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    /// `GET <key>` — fetch the value for `key`, or nil if absent/expired.
     Get { key: Vec<u8> },
+    /// `SET <key> <value>` — insert or replace `key`'s value. TTL handling is up to
+    /// the executor; this variant carries no TTL on its own.
     Set { key: Vec<u8>, value: Vec<u8> },
+    /// `DEL <key>` — remove `key` if present.
     Delete { key: Vec<u8> },
+    /// `PING` (no arg) or `PING <message>` — health check; echoes `message` back as a
+    /// bulk string when present, otherwise replies `+PONG`.
     Ping { message: Option<Vec<u8>> },
+    /// `EXISTS <key>` — `1` if `key` is present (and not expired), `0` otherwise.
     Exists { key: Vec<u8> },
+    /// `EXPIRE <key> <seconds>` — set a relative TTL on `key`. `relative_ttl` is
+    /// seconds-from-now; the cache layer converts to absolute UNIX seconds.
     Expire { key: Vec<u8>, relative_ttl: u64 },
+    /// `EXPIREAT <key> <timestamp>` — set an absolute TTL on `key` as UNIX seconds.
+    /// A past timestamp deletes the key immediately (matches real Redis).
     ExpireAt { key: Vec<u8>, absolute_ttl: u64 },
+    /// `TTL <key>` — query remaining TTL in seconds. Replies `:-2` if missing, `:-1`
+    /// if `key` has no TTL, `:n` for seconds remaining.
     TTL { key: Vec<u8> },
+    /// `PERSIST <key>` — remove the TTL from `key` (keep the value). Replies `:1` if
+    /// a TTL was removed, `:0` if `key` is missing or already had no TTL.
     Persist { key: Vec<u8> },
 }
 
 impl Command {
+    /// Build a [`Command::Get`] from anything that converts into `Vec<u8>`.
     pub fn get(key: impl Into<Vec<u8>>) -> Self {
         Self::Get { key: key.into() }
     }
 
+    /// Build a [`Command::Set`] from convertible key + value bytes.
     pub fn set(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
         Self::Set {
             key: key.into(),
@@ -40,18 +82,23 @@ impl Command {
         }
     }
 
+    /// Build a [`Command::Delete`] from a convertible key.
     pub fn delete(key: impl Into<Vec<u8>>) -> Self {
         Self::Delete { key: key.into() }
     }
 
+    /// Build a [`Command::Ping`]. Pass `None` for plain `PING`, `Some(bytes)` to echo
+    /// a message back to the client.
     pub fn ping(message: Option<Vec<u8>>) -> Self {
         Self::Ping { message }
     }
 
+    /// Build a [`Command::Exists`] from a convertible key.
     pub fn exists(key: impl Into<Vec<u8>>) -> Self {
         Self::Exists { key: key.into() }
     }
 
+    /// Build a [`Command::Expire`] with a relative TTL in seconds-from-now.
     pub fn expire(key: impl Into<Vec<u8>>, relative_ttl: u64) -> Self {
         Self::Expire {
             key: key.into(),
@@ -59,6 +106,7 @@ impl Command {
         }
     }
 
+    /// Build a [`Command::ExpireAt`] with an absolute TTL in UNIX seconds.
     pub fn expire_at(key: impl Into<Vec<u8>>, absolute_ttl: u64) -> Self {
         Self::ExpireAt {
             key: key.into(),
@@ -66,10 +114,12 @@ impl Command {
         }
     }
 
+    /// Build a [`Command::TTL`] from a convertible key.
     pub fn ttl(key: impl Into<Vec<u8>>) -> Self {
         Self::TTL { key: key.into() }
     }
 
+    /// Build a [`Command::Persist`] from a convertible key.
     pub fn persist(key: impl Into<Vec<u8>>) -> Self {
         Self::Persist { key: key.into() }
     }

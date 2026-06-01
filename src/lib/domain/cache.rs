@@ -1,3 +1,26 @@
+//! In-memory key-value store with TTL support, snapshot persistence, and lazy + active
+//! expiry.
+//!
+//! [`Cache`] is the only type a caller needs. It wraps `Arc<Mutex<HashMap<Vec<u8>, Entry>>>`
+//! so handles are cheap to clone across threads and the underlying map is shared. Every
+//! read path drops expired keys it encounters (lazy expiry); a separate sweeper thread
+//! in `inbound::server` calls [`Cache::remove_expired`] periodically to reclaim keys no
+//! one has touched.
+//!
+//! ## Expiry model
+//!
+//! TTLs are stored as absolute UNIX seconds inside each [`Entry`]. Relative TTLs are
+//! converted to absolute at the API boundary, so the storage representation is uniform
+//! and serializable. `SystemTime` (not `Instant`) is used because `Instant` is
+//! process-local and meaningless across a restart — wall-clock skew at second-level
+//! granularity is acceptable for a TTL.
+//!
+//! ## Persistence
+//!
+//! [`Cache::init`] and [`Cache::persist`] take an `impl Into<PathBuf>` so callers control
+//! where the snapshot lives. The on-disk format is `wincode`-serialized
+//! `HashMap<Vec<u8>, Entry>`; no path constant is baked into this module.
+
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -9,27 +32,47 @@ use std::{
 use thiserror::Error;
 use wincode::{ReadError, SchemaRead, SchemaWrite, WriteError};
 
+/// Errors a [`Cache`] operation can return.
 #[derive(Debug, Error)]
 pub enum CacheError {
+    /// Filesystem I/O failure during snapshot load or persist.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// Snapshot deserialization failed (likely a corrupt or incompatible file).
     #[error(transparent)]
     Read(#[from] ReadError),
+    /// Snapshot serialization failed.
     #[error(transparent)]
     Write(#[from] WriteError),
+    /// The shared mutex was poisoned by a thread that panicked while holding it.
+    /// Poisoning means the in-memory state may be inconsistent; the cache cannot be
+    /// safely used after this.
     #[error("cache mutex poisoned")]
     MutexPoisoned,
+    /// `SystemTime::now()` returned a value before the UNIX epoch — only possible if
+    /// the system clock is badly wrong.
     #[error(transparent)]
     SystemTime(#[from] SystemTimeError),
 }
 
+/// A single cache entry: opaque value bytes plus an optional absolute TTL.
+///
+/// `absolute_ttl` is UNIX seconds (wall clock). `None` means the entry has no expiry
+/// and lives until explicitly removed. Past timestamps are accepted but a subsequent
+/// read on this key will treat the entry as expired and drop it (lazy expiry).
 #[derive(Clone, Debug, Default, SchemaWrite, SchemaRead, PartialEq, Hash)]
 pub struct Entry {
+    /// Opaque payload bytes — UTF-8 is never enforced so values can be jpegs, RESP
+    /// fragments, anything.
     pub value: Vec<u8>,
+    /// Absolute UNIX seconds at which this entry expires, or `None` for no TTL.
     pub absolute_ttl: Option<u64>,
 }
 
 impl Entry {
+    /// Build an [`Entry`] from convertible value bytes plus an optional absolute TTL.
+    /// To set a relative TTL, build with `None` and call [`Cache::set_relative_ttl`]
+    /// afterwards — the cache layer handles the now+seconds arithmetic.
     pub fn new(value: impl Into<Vec<u8>>, absolute_ttl: Option<u64>) -> Self {
         Self {
             value: value.into(),
@@ -38,12 +81,26 @@ impl Entry {
     }
 }
 
+/// Thread-safe shared in-memory KV store.
+///
+/// Cloning a `Cache` clones the underlying `Arc` — every clone refers to the same
+/// backing map. This is how the server hands the cache to its connection threads,
+/// sweeper, and persistence loop.
+///
+/// `Default` yields an empty in-memory cache backed by a fresh `Arc<Mutex<…>>`; use it
+/// for tests or for callers that don't want snapshot persistence. Use [`Cache::init`]
+/// to load from disk.
 #[derive(Clone, Debug, Default)]
 pub struct Cache {
     inner: Arc<Mutex<HashMap<Vec<u8>, Entry>>>,
 }
 
 impl Cache {
+    /// Fetch a clone of the [`Entry`] for `key`, or `None` if missing or expired.
+    ///
+    /// If the entry exists but its `absolute_ttl` has passed, this returns `None` *and*
+    /// removes the entry — that's the lazy-expiry contract. Lock is held across the
+    /// expiry check and removal so a concurrent insert can't race in between.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Entry>, CacheError> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
@@ -59,6 +116,11 @@ impl Cache {
         }
     }
 
+    /// Insert or replace `key` with `entry`. Returns the previous entry if one existed,
+    /// `None` if `key` is new.
+    ///
+    /// An entry whose `absolute_ttl` is already in the past is accepted as-is — the next
+    /// read drops it lazily. The caller does not need to clock-check before inserting.
     pub fn insert(
         &self,
         key: impl Into<Vec<u8>>,
@@ -68,11 +130,16 @@ impl Cache {
         Ok(guard.insert(key.into(), entry))
     }
 
+    /// Remove `key` from the cache. Returns the removed entry if one existed.
+    /// Does not consult TTL — this is an unconditional delete.
     pub fn remove(&self, key: impl AsRef<[u8]>) -> Result<Option<Entry>, CacheError> {
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
         Ok(guard.remove(key.as_ref()))
     }
 
+    /// Test for `key`'s presence. Honors lazy expiry: an expired key returns `false`
+    /// and is dropped from the map on its way out, matching what a subsequent
+    /// [`Cache::get`] would see.
     pub fn contains(&self, key: impl AsRef<[u8]>) -> Result<bool, CacheError> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
@@ -90,6 +157,13 @@ impl Cache {
         }
     }
 
+    /// Set an absolute TTL (UNIX seconds) on an existing key. Returns `true` if the
+    /// TTL was applied — including the immediate-deletion case where the timestamp is
+    /// already past and `key` existed. Returns `false` if `key` was missing.
+    ///
+    /// A past timestamp triggers immediate removal rather than storing an
+    /// already-expired entry. This matches real Redis EXPIREAT semantics and means
+    /// the lazy-expiry path doesn't have to handle a guaranteed-stale case.
     pub fn set_absolute_ttl(
         &self,
         key: impl AsRef<[u8]>,
@@ -107,6 +181,13 @@ impl Cache {
         Ok(true)
     }
 
+    /// Set a relative TTL (seconds-from-now) on an existing key. Converts to absolute
+    /// and delegates to [`Cache::set_absolute_ttl`]. `saturating_add` on the conversion
+    /// guards against `u64` overflow on huge TTLs.
+    ///
+    /// `relative_ttl == 0` produces an absolute timestamp equal to *now*, which the
+    /// `>=` check inside [`Cache::set_absolute_ttl`] treats as past — so `EXPIRE foo 0`
+    /// deletes immediately, matching real Redis.
     pub fn set_relative_ttl(
         &self,
         key: impl AsRef<[u8]>,
@@ -117,6 +198,15 @@ impl Cache {
         self.set_absolute_ttl(key, absolute_ttl)
     }
 
+    /// Query the absolute TTL for `key`. The double `Option` carries three distinct
+    /// states:
+    ///
+    /// - `Ok(None)` — `key` is missing (or was expired and just got swept here).
+    /// - `Ok(Some(None))` — `key` exists but has no TTL set.
+    /// - `Ok(Some(Some(t)))` — `key` exists with absolute UNIX timestamp `t`.
+    ///
+    /// Honors lazy expiry: if the stored TTL has passed, the entry is removed and the
+    /// function returns `Ok(None)`.
     pub fn get_absolute_ttl(
         &self,
         key: impl AsRef<[u8]>,
@@ -135,6 +225,14 @@ impl Cache {
         Ok(Some(ttl))
     }
 
+    /// Query the relative TTL (seconds remaining) for `key`. Same three-state shape as
+    /// [`Cache::get_absolute_ttl`]:
+    ///
+    /// - `Ok(None)` — `key` missing or just-expired.
+    /// - `Ok(Some(None))` — `key` exists with no TTL.
+    /// - `Ok(Some(Some(n)))` — `n` seconds remaining (saturating; can't underflow).
+    ///
+    /// Drives the wire `TTL` command reply: `:-2` / `:-1` / `:n`.
     pub fn get_relative_ttl(
         &self,
         key: impl AsRef<[u8]>,
@@ -148,6 +246,10 @@ impl Cache {
         Ok(Some(Some(absolute_ttl.saturating_sub(now))))
     }
 
+    /// Drop the TTL on `key` (keep the value). Returns `true` if a TTL was actually
+    /// removed, `false` if `key` is missing or already had no TTL.
+    ///
+    /// Drives `PERSIST`: `:1` when a TTL was cleared, `:0` otherwise.
     pub fn remove_ttl(&self, key: impl AsRef<[u8]>) -> Result<bool, CacheError> {
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
         let Some(entry) = guard.get_mut(key.as_ref()) else {
@@ -161,6 +263,9 @@ impl Cache {
         }
     }
 
+    /// Load a cache from a snapshot at `path`. A missing file is not an error —
+    /// returns an empty cache. Any other I/O error or a corrupt snapshot surfaces as
+    /// [`CacheError::Io`] / [`CacheError::Read`].
     pub fn init(path: impl Into<PathBuf>) -> Result<Self, CacheError> {
         let buf = match File::open(path.into()) {
             Ok(mut file) => {
@@ -181,6 +286,13 @@ impl Cache {
         })
     }
 
+    /// Write a `wincode`-serialized snapshot of the current map to `path`, truncating
+    /// any existing file.
+    ///
+    /// The lock is held only long enough to clone the inner map; serialization and
+    /// disk I/O run outside the critical section so writers aren't blocked on a slow
+    /// disk. Tradeoff: a writer that commits between clone and write_all isn't in the
+    /// snapshot — acceptable for periodic-snapshot durability semantics.
     pub fn persist(&self, path: impl Into<PathBuf>) -> Result<(), CacheError> {
         let inner = self
             .inner
@@ -197,6 +309,12 @@ impl Cache {
         Ok(())
     }
 
+    /// Sweep all expired entries. Returns the count of keys removed. Called by the
+    /// background sweeper thread in `inbound::server` on a periodic tick.
+    ///
+    /// The lock is held for the full scan-and-delete pass. At current scale the sweep
+    /// is microseconds; if it ever starts to hurt tail latency, switch to a
+    /// snapshot-then-evict pattern with a TTL re-check during the eviction phase.
     pub fn remove_expired(&self) -> Result<usize, CacheError> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;

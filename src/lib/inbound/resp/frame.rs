@@ -1,36 +1,67 @@
+//! RESP frame parser. Streams `&[u8]` into [`Frame`] values and signals to the caller
+//! when more bytes are needed via [`FrameError::Incomplete`].
+//!
+//! Only two frame shapes are recognized — RESP arrays (`*`) and bulk strings (`$`).
+//! That's the entire surface a client uses to send commands; outbound reply types
+//! (simple strings, errors, integers, null-bulk) live in the outbound layer.
+
 use crate::inbound::resp::crlf::Crlf;
 use std::{num::ParseIntError, str::Utf8Error};
 use thiserror::Error;
 
+/// Errors returned by the frame parser.
 #[derive(Debug, Error)]
 pub enum FrameError {
+    /// A bulk-string payload wasn't followed by the required `\r\n`.
     #[error("missing crlf terminator")]
     MissingTerminator,
+    /// The header byte wasn't `*` or `$` — no command-shaped frame can start with it.
     #[error("unknown sigil")]
     UnknownSigil,
+    /// The header's length bytes didn't form a valid `usize` (bad UTF-8 or non-digit).
     #[error("failed to parse length: {0}")]
     InvalidLength(#[from] ParseLengthError),
+    /// Not enough bytes to finish parsing this frame yet. Caller should read more from
+    /// the socket and try again with the extended buffer.
     #[error("incomplete frame")]
     Incomplete,
+    /// Bytes formed a CRLF-terminated header but the header itself is too short to be
+    /// a valid sigil-plus-length pair.
     #[error("malformed value")]
     Malformed,
 }
 
+/// Specific failure modes for parsing the length number off a RESP header.
 #[derive(Debug, Error)]
 pub enum ParseLengthError {
+    /// The length bytes weren't valid UTF-8.
     #[error(transparent)]
     Utf8(#[from] Utf8Error),
+    /// The length bytes were UTF-8 but didn't parse as a `usize`.
     #[error(transparent)]
     ParseInt(#[from] ParseIntError),
 }
 
+/// A parsed RESP frame. Only the two shapes a client uses to send commands.
+///
+/// `BulkString` payloads are arbitrary bytes — the parser does not enforce UTF-8.
+/// `Array` is recursive (an array of frames), but parsing iterates rather than
+/// recurses, so deeply-nested arrays cannot blow the stack.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
+    /// `*<n>\r\n` followed by `n` frames.
     Array(Vec<Frame>),
+    /// `$<len>\r\n<bytes>\r\n`. Length is taken from the header; payload is bytes-exact.
     BulkString(Vec<u8>),
 }
 
 impl Frame {
+    /// Parse one frame from the front of `bytes`. Returns the parsed frame and the
+    /// leftover slice (borrowed from the input — no allocation for the rest-of-buffer).
+    ///
+    /// Returns [`FrameError::Incomplete`] when there aren't enough bytes yet. That's
+    /// the load-bearing signal the session layer uses to keep reading from the socket
+    /// before retrying.
     pub fn parse_one(bytes: &[u8]) -> Result<(Frame, &[u8]), FrameError> {
         let Some((header, bytes)) = bytes.split_crlf() else {
             return Err(FrameError::Incomplete);
@@ -51,6 +82,9 @@ impl Frame {
         }
     }
 
+    /// Parse `len` consecutive frames from `bytes` into a [`Frame::Array`]. Iterative
+    /// (not recursive) so an array of N elements uses O(1) stack regardless of N — the
+    /// guard against `MGET key1..key100000` blowing the stack.
     pub fn parse_array(bytes: &[u8], len: usize) -> Result<(Frame, &[u8]), FrameError> {
         let mut vec = Vec::new();
         let mut buf: &[u8] = bytes;
@@ -62,6 +96,9 @@ impl Frame {
         Ok((Frame::Array(vec), buf))
     }
 
+    /// Parse a bulk string of exactly `len` bytes followed by `\r\n`. Returns
+    /// [`FrameError::MissingTerminator`] if the buffer is too short or the trailing
+    /// `\r\n` is missing.
     pub fn parse_bulk_string(bytes: &[u8], len: usize) -> Result<(Frame, &[u8]), FrameError> {
         if bytes.len() < len + 2 || &bytes[len..len + 2] != b"\r\n" {
             return Err(FrameError::MissingTerminator);

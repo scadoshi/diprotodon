@@ -1,5 +1,20 @@
+//! `Crlf` — byte-slice utilities for the `\r\n` terminator RESP uses between every
+//! header and payload. Implemented for `[u8]` so callers can write `bytes.split_crlf()`
+//! on any slice without ceremony.
+
+/// Operations for inspecting and splitting on the RESP `\r\n` terminator.
+///
+/// Both methods are non-allocating and return slices that borrow from the receiver.
 pub trait Crlf {
+    /// `true` if the slice starts with exactly the two bytes `\r\n`.
+    /// Returns `false` for shorter inputs or any other prefix.
     fn is_crlf(&self) -> bool;
+
+    /// Split on the *first* `\r\n` in the slice. Returns `(before, after)` excluding
+    /// the terminator itself.
+    ///
+    /// Returns `None` when no `\r\n` is found — this `None` is load-bearing in the
+    /// parser layer above as the "incomplete frame, please read more" signal.
     fn split_crlf(&self) -> Option<(&[u8], &[u8])>;
 }
 

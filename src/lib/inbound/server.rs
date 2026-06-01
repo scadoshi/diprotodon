@@ -1,3 +1,24 @@
+//! TCP server and lifecycle. Owns the accept loop, the shared [`Cache`], and the
+//! background threads (persistence ticker, TTL sweeper, stdin shutdown listener).
+//!
+//! ## Thread topology
+//!
+//! - **main thread** — accept loop, spawns per-connection [`Session`] threads.
+//! - **persistence thread** — calls `cache.persist` every 10s, plus a final persist on
+//!   shutdown.
+//! - **sweeper thread** — calls `cache.remove_expired` every 10s for active TTL eviction.
+//! - **shutdown thread** — blocks on stdin; EOF / `quit` / `exit` flips the shared flag.
+//! - **session threads** — one per accepted connection, joined on shutdown.
+//!
+//! All long-running threads hold an `Arc<AtomicBool>` shutdown flag and check it on a
+//! 100ms-tick budget so shutdown latency is bounded. `JoinHandle`s are collected and
+//! pruned via `is_finished()` while the server runs, and joined fully on exit so no
+//! work is silently dropped.
+//!
+//! The listener is set non-blocking so the accept loop polls the shutdown flag without
+//! getting stuck inside `accept()`. A 50ms sleep on `WouldBlock` keeps the loop from
+//! burning a CPU when no clients are connecting.
+
 use crate::{domain::cache::Cache, inbound::session::Session};
 use std::{
     net::TcpListener,
@@ -8,11 +29,22 @@ use std::{
     thread::{JoinHandle, spawn},
 };
 
+/// Address the server binds for client connections.
 const BIND_ADDRESS: &str = "127.0.0.1:3000";
+/// On-disk path for the cache snapshot. Lives here (not in `cache.rs`) so the cache
+/// module stays I/O-policy-agnostic — `Cache::init` / `Cache::persist` both take an
+/// `impl Into<PathBuf>`.
 const CACHE_PATH: &str = "cache";
 
+/// Zero-sized handle exposing [`Server::run`]. The server itself is just a function;
+/// the struct exists so callers have a stable `Server::run` entry point.
 pub struct Server;
 impl Server {
+    /// Start the server. Blocks until shutdown is signaled (stdin EOF / `quit` / `exit`),
+    /// then joins every spawned thread before returning.
+    ///
+    /// Returns `Err` only on a fatal setup error (bind failure, snapshot load failure).
+    /// Per-connection or per-thread errors are logged but do not bubble out.
     pub fn run() -> anyhow::Result<()> {
         let listener = TcpListener::bind(BIND_ADDRESS)?;
         listener.set_nonblocking(true)?;

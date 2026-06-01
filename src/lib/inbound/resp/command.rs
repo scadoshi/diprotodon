@@ -1,13 +1,26 @@
+//! Lifts a parsed RESP [`Frame`] into a domain [`Command`].
+//!
+//! A valid command on the wire is always an array of bulk strings: the first is the
+//! verb (case-insensitive), the rest are arguments. Anything else — a bare bulk string,
+//! an array whose first element is an array, an inner array where a key is expected —
+//! is a [`CommandFromFrameError::UnexpectedFrame`]. Verb-level errors (wrong arity,
+//! non-numeric TTL, unknown verb) surface as [`CommandError`].
+
 use crate::{
     domain::command::{Command, CommandError},
     inbound::resp::frame::Frame,
 };
 use thiserror::Error;
 
+/// Errors produced while turning a [`Frame`] into a [`Command`].
 #[derive(Debug, Error)]
 pub enum CommandFromFrameError {
+    /// Verb-level semantic error from the domain layer (wrong arity, unknown verb,
+    /// numeric arg failed to parse, etc.).
     #[error(transparent)]
     CommandError(#[from] CommandError),
+    /// The outer frame wasn't an array of bulk strings, or a nested frame appeared
+    /// where the protocol requires a bulk string (e.g. an array passed as a key).
     #[error("unexpected value; command is made of an array of bulk strings")]
     UnexpectedFrame,
 }
