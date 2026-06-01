@@ -1,6 +1,6 @@
 use crate::{
     domain::{
-        cache::{Cache, CacheError},
+        cache::{Cache, CacheError, Entry},
         command::Command,
     },
     inbound::resp::frame::{Frame, FrameError},
@@ -122,12 +122,13 @@ impl<R: Read, W: Write> Session<R, W> {
             Command::Get { key } => {
                 let value = self.cache.get(&key)?;
                 match value {
-                    Some(value) => Reply::BulkString(value),
+                    Some(Entry { value, .. }) => Reply::BulkString(value),
                     None => Reply::NullBulk,
                 }
             }
             Command::Set { key, value } => {
-                self.cache.insert(key.as_slice(), value.as_slice())?;
+                self.cache
+                    .insert(key.as_slice(), Entry::new(value.as_slice(), None))?;
                 Reply::SimpleString(SimpleInner::ok())
             }
             Command::Delete { key } => Reply::Integer(self.cache.remove(&key)?.is_some() as i64),

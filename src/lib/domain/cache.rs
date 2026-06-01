@@ -2,13 +2,12 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{Read, Write},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 use thiserror::Error;
 use wincode::{ReadError, SchemaRead, SchemaWrite, WriteError};
-
-const CACHE_PATH: &str = "cache";
 
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -24,41 +23,71 @@ pub enum CacheError {
     SystemTime(#[from] SystemTimeError),
 }
 
-#[derive(Clone, Debug, Default, SchemaWrite, SchemaRead)]
-struct Inner {
-    values: HashMap<Vec<u8>, Vec<u8>>,
-    expiries: HashMap<Vec<u8>, u64>,
+#[derive(Clone, Debug, Default, SchemaWrite, SchemaRead, PartialEq, Hash)]
+pub struct Entry {
+    pub value: Vec<u8>,
+    pub absolute_ttl: Option<u64>,
+}
+
+impl Entry {
+    pub fn new(value: impl Into<Vec<u8>>, absolute_ttl: Option<u64>) -> Self {
+        Self {
+            value: value.into(),
+            absolute_ttl,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Cache {
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Mutex<HashMap<Vec<u8>, Entry>>>,
 }
 
 impl Cache {
-    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, CacheError> {
-        let guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
-        Ok(guard.values.get(key.as_ref()).cloned())
+    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Entry>, CacheError> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
+        let entry = guard.get(key.as_ref()).cloned();
+        if entry
+            .as_ref()
+            .is_some_and(|e| e.absolute_ttl.is_some_and(|t| now >= t))
+        {
+            guard.remove(key.as_ref());
+            Ok(None)
+        } else {
+            Ok(entry)
+        }
     }
 
     pub fn insert(
         &self,
         key: impl Into<Vec<u8>>,
-        value: impl Into<Vec<u8>>,
-    ) -> Result<Option<Vec<u8>>, CacheError> {
+        entry: Entry,
+    ) -> Result<Option<Entry>, CacheError> {
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
-        Ok(guard.values.insert(key.into(), value.into()))
+        Ok(guard.insert(key.into(), entry))
     }
 
-    pub fn remove(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, CacheError> {
+    pub fn remove(&self, key: impl AsRef<[u8]>) -> Result<Option<Entry>, CacheError> {
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
-        guard.expiries.remove(key.as_ref());
-        Ok(guard.values.remove(key.as_ref()))
+        Ok(guard.remove(key.as_ref()))
     }
 
     pub fn contains(&self, key: impl AsRef<[u8]>) -> Result<bool, CacheError> {
-        let guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
-        Ok(guard.values.contains_key(key.as_ref()))
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
+        let entry = guard.get(key.as_ref());
+        match entry {
+            Some(Entry {
+                absolute_ttl: Some(t),
+                ..
+            }) if now >= *t => {
+                guard.remove(key.as_ref());
+                Ok(false)
+            }
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
     }
 
     pub fn set_absolute_ttl(
@@ -71,12 +100,11 @@ impl Cache {
             return Ok(self.remove(key)?.is_some());
         }
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
-        if guard.values.contains_key(key.as_ref()) {
-            guard.expiries.insert(key.as_ref().to_owned(), absolute_ttl);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let Some(entry) = guard.get_mut(key.as_ref()) else {
+            return Ok(false);
+        };
+        entry.absolute_ttl = Some(absolute_ttl);
+        Ok(true)
     }
 
     pub fn set_relative_ttl(
@@ -94,19 +122,17 @@ impl Cache {
         key: impl AsRef<[u8]>,
     ) -> Result<Option<Option<u64>>, CacheError> {
         let guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
-        if !guard.values.contains_key(key.as_ref()) {
+        let Some(Entry { absolute_ttl, .. }) = guard.get(key.as_ref()) else {
             return Ok(None);
-        }
-        let Some(absolute_ttl) = guard.expiries.get(key.as_ref()).copied() else {
-            return Ok(Some(None));
         };
+        let ttl = absolute_ttl.to_owned();
         drop(guard);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        if now >= absolute_ttl {
+        if ttl.is_some_and(|t| now >= t) {
             self.remove(key)?;
             return Ok(None);
         }
-        Ok(Some(Some(absolute_ttl)))
+        Ok(Some(ttl))
     }
 
     pub fn get_relative_ttl(
@@ -124,11 +150,19 @@ impl Cache {
 
     pub fn remove_ttl(&self, key: impl AsRef<[u8]>) -> Result<bool, CacheError> {
         let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
-        Ok(guard.expiries.remove(key.as_ref()).is_some())
+        let Some(entry) = guard.get_mut(key.as_ref()) else {
+            return Ok(false);
+        };
+        if entry.absolute_ttl.is_some() {
+            entry.absolute_ttl = None;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
-    pub fn init() -> Result<Self, CacheError> {
-        let buf = match File::open(CACHE_PATH) {
+    pub fn init(path: impl Into<PathBuf>) -> Result<Self, CacheError> {
+        let buf = match File::open(path.into()) {
             Ok(mut file) => {
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf)?;
@@ -137,17 +171,17 @@ impl Cache {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        let inner = if buf.is_empty() {
-            Inner::default()
+        let entries = if buf.is_empty() {
+            HashMap::new()
         } else {
             wincode::deserialize(&buf)?
         };
         Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
+            inner: Arc::new(Mutex::new(entries)),
         })
     }
 
-    pub fn persist(&self) -> Result<(), CacheError> {
+    pub fn persist(&self, path: impl Into<PathBuf>) -> Result<(), CacheError> {
         let inner = self
             .inner
             .lock()
@@ -158,24 +192,502 @@ impl Cache {
             .write(true)
             .truncate(true)
             .create(true)
-            .open(CACHE_PATH)?;
+            .open(path.into())?;
         file.write_all(&bytes)?;
         Ok(())
     }
 
     pub fn remove_expired(&self) -> Result<usize, CacheError> {
-        let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut guard = self.inner.lock().map_err(|_| CacheError::MutexPoisoned)?;
         let expired: Vec<Vec<u8>> = guard
-            .expiries
             .iter()
-            .filter(|(_, ttl)| now >= **ttl)
+            .filter(|(_, Entry { absolute_ttl, .. })| absolute_ttl.is_some_and(|t| now >= t))
             .map(|(key, _)| key.to_owned())
             .collect();
         for key in expired.iter() {
-            guard.values.remove(key);
-            guard.expiries.remove(key);
+            guard.remove(key);
         }
         Ok(expired.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // ---------- helpers ----------
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// A unique temp path that auto-cleans on drop.
+    struct TmpPath(PathBuf);
+    impl TmpPath {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!("diprotodon-test-{}.cache", nanos)))
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // ---------- Entry ----------
+
+    #[test]
+    fn entry_constructor_without_ttl() {
+        assert_eq!(
+            Entry::new("foo", None),
+            Entry {
+                value: b"foo".to_vec(),
+                absolute_ttl: None
+            }
+        );
+    }
+
+    #[test]
+    fn entry_constructor_with_ttl() {
+        assert_eq!(
+            Entry::new("foo", Some(123)),
+            Entry {
+                value: b"foo".to_vec(),
+                absolute_ttl: Some(123)
+            }
+        );
+    }
+
+    // ---------- get ----------
+
+    #[test]
+    fn get_miss_returns_none() {
+        let cache = Cache::default();
+        assert_eq!(cache.get("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn get_hit_no_ttl_returns_entry() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("bar", None)));
+    }
+
+    #[test]
+    fn get_hit_future_ttl_returns_entry() {
+        let cache = Cache::default();
+        let future = now() + 3600;
+        cache
+            .insert("foo", Entry::new("bar", Some(future)))
+            .unwrap();
+        assert_eq!(
+            cache.get("foo").unwrap(),
+            Some(Entry::new("bar", Some(future)))
+        );
+    }
+
+    #[test]
+    fn get_hit_expired_returns_none_and_removes() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", Some(1))).unwrap();
+        assert_eq!(cache.get("foo").unwrap(), None);
+        // Verify the lazy expiry actually removed it.
+        assert!(!cache.contains("foo").unwrap());
+    }
+
+    #[test]
+    fn get_hit_at_exact_expiry_returns_none() {
+        let cache = Cache::default();
+        let t = now();
+        cache.insert("foo", Entry::new("bar", Some(t))).unwrap();
+        // now >= t triggers the expired branch.
+        assert_eq!(cache.get("foo").unwrap(), None);
+    }
+
+    // ---------- insert ----------
+
+    #[test]
+    fn insert_new_returns_none() {
+        let cache = Cache::default();
+        assert_eq!(cache.insert("foo", Entry::new("bar", None)).unwrap(), None);
+    }
+
+    #[test]
+    fn insert_existing_returns_old_entry() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("old", None)).unwrap();
+        assert_eq!(
+            cache.insert("foo", Entry::new("new", None)).unwrap(),
+            Some(Entry::new("old", None))
+        );
+    }
+
+    #[test]
+    fn insert_replaces_value_and_ttl() {
+        let cache = Cache::default();
+        cache
+            .insert("foo", Entry::new("old", Some(now() + 100)))
+            .unwrap();
+        cache.insert("foo", Entry::new("new", None)).unwrap();
+        assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("new", None)));
+    }
+
+    // ---------- remove ----------
+
+    #[test]
+    fn remove_hit_returns_entry() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert_eq!(cache.remove("foo").unwrap(), Some(Entry::new("bar", None)));
+    }
+
+    #[test]
+    fn remove_miss_returns_none() {
+        let cache = Cache::default();
+        assert_eq!(cache.remove("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn remove_actually_removes() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        cache.remove("foo").unwrap();
+        assert_eq!(cache.get("foo").unwrap(), None);
+    }
+
+    // ---------- contains ----------
+
+    #[test]
+    fn contains_miss_returns_false() {
+        let cache = Cache::default();
+        assert!(!cache.contains("missing").unwrap());
+    }
+
+    #[test]
+    fn contains_hit_no_ttl_returns_true() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert!(cache.contains("foo").unwrap());
+    }
+
+    #[test]
+    fn contains_hit_future_ttl_returns_true() {
+        let cache = Cache::default();
+        cache
+            .insert("foo", Entry::new("bar", Some(now() + 3600)))
+            .unwrap();
+        assert!(cache.contains("foo").unwrap());
+    }
+
+    #[test]
+    fn contains_hit_expired_returns_false_and_removes() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", Some(1))).unwrap();
+        assert!(!cache.contains("foo").unwrap());
+        // Subsequent direct lookups confirm the entry is gone.
+        assert_eq!(cache.get("foo").unwrap(), None);
+    }
+
+    // ---------- set_absolute_ttl ----------
+
+    #[test]
+    fn set_absolute_ttl_existing_key_future_returns_true_and_sets() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        let future = now() + 3600;
+        assert!(cache.set_absolute_ttl("foo", future).unwrap());
+        assert_eq!(
+            cache.get("foo").unwrap(),
+            Some(Entry::new("bar", Some(future)))
+        );
+    }
+
+    #[test]
+    fn set_absolute_ttl_missing_key_future_returns_false() {
+        let cache = Cache::default();
+        assert!(!cache.set_absolute_ttl("missing", now() + 3600).unwrap());
+    }
+
+    #[test]
+    fn set_absolute_ttl_past_existing_key_removes_and_returns_true() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert!(cache.set_absolute_ttl("foo", 0).unwrap());
+        assert_eq!(cache.get("foo").unwrap(), None);
+    }
+
+    #[test]
+    fn set_absolute_ttl_past_missing_key_returns_false() {
+        let cache = Cache::default();
+        assert!(!cache.set_absolute_ttl("missing", 0).unwrap());
+    }
+
+    #[test]
+    fn set_absolute_ttl_overwrites_existing_ttl() {
+        let cache = Cache::default();
+        cache
+            .insert("foo", Entry::new("bar", Some(now() + 100)))
+            .unwrap();
+        let new_ttl = now() + 7200;
+        assert!(cache.set_absolute_ttl("foo", new_ttl).unwrap());
+        assert_eq!(cache.get_absolute_ttl("foo").unwrap(), Some(Some(new_ttl)));
+    }
+
+    // ---------- set_relative_ttl ----------
+
+    #[test]
+    fn set_relative_ttl_existing_key_returns_true_and_sets_absolute() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        let before = now();
+        assert!(cache.set_relative_ttl("foo", 3600).unwrap());
+        let after = now();
+        let ttl = match cache.get_absolute_ttl("foo").unwrap() {
+            Some(Some(t)) => t,
+            other => panic!("expected Some(Some(_)), got {:?}", other),
+        };
+        // Allow for the clock to tick during the call.
+        assert!(ttl >= before + 3600 && ttl <= after + 3600);
+    }
+
+    #[test]
+    fn set_relative_ttl_missing_key_returns_false() {
+        let cache = Cache::default();
+        assert!(!cache.set_relative_ttl("missing", 3600).unwrap());
+    }
+
+    #[test]
+    fn set_relative_ttl_zero_seconds_removes_immediately() {
+        // EXPIRE key 0 → absolute_ttl == now → set_absolute_ttl removes (matches real Redis).
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert!(cache.set_relative_ttl("foo", 0).unwrap());
+        assert_eq!(cache.get("foo").unwrap(), None);
+    }
+
+    // ---------- get_absolute_ttl ----------
+
+    #[test]
+    fn get_absolute_ttl_missing_key_returns_none() {
+        let cache = Cache::default();
+        assert_eq!(cache.get_absolute_ttl("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn get_absolute_ttl_no_ttl_returns_some_none() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert_eq!(cache.get_absolute_ttl("foo").unwrap(), Some(None));
+    }
+
+    #[test]
+    fn get_absolute_ttl_future_returns_some_some_timestamp() {
+        let cache = Cache::default();
+        let future = now() + 3600;
+        cache
+            .insert("foo", Entry::new("bar", Some(future)))
+            .unwrap();
+        assert_eq!(cache.get_absolute_ttl("foo").unwrap(), Some(Some(future)));
+    }
+
+    #[test]
+    fn get_absolute_ttl_expired_removes_and_returns_none() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", Some(1))).unwrap();
+        assert_eq!(cache.get_absolute_ttl("foo").unwrap(), None);
+        // Confirm the lazy expiry physically removed the entry.
+        assert!(!cache.contains("foo").unwrap());
+    }
+
+    // ---------- get_relative_ttl ----------
+
+    #[test]
+    fn get_relative_ttl_missing_key_returns_none() {
+        let cache = Cache::default();
+        assert_eq!(cache.get_relative_ttl("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn get_relative_ttl_no_ttl_returns_some_none() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert_eq!(cache.get_relative_ttl("foo").unwrap(), Some(None));
+    }
+
+    #[test]
+    fn get_relative_ttl_future_returns_remaining_seconds() {
+        let cache = Cache::default();
+        let future = now() + 3600;
+        cache
+            .insert("foo", Entry::new("bar", Some(future)))
+            .unwrap();
+        let remaining = match cache.get_relative_ttl("foo").unwrap() {
+            Some(Some(t)) => t,
+            other => panic!("expected Some(Some(_)), got {:?}", other),
+        };
+        // Should be ~3600s; allow some slack for clock tick during the call.
+        assert!((3590_u64..=3600).contains(&remaining));
+    }
+
+    #[test]
+    fn get_relative_ttl_expired_returns_none() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", Some(1))).unwrap();
+        assert_eq!(cache.get_relative_ttl("foo").unwrap(), None);
+    }
+
+    // ---------- remove_ttl ----------
+
+    #[test]
+    fn remove_ttl_had_ttl_returns_true_and_clears() {
+        let cache = Cache::default();
+        cache
+            .insert("foo", Entry::new("bar", Some(now() + 100)))
+            .unwrap();
+        assert!(cache.remove_ttl("foo").unwrap());
+        assert_eq!(cache.get_absolute_ttl("foo").unwrap(), Some(None));
+    }
+
+    #[test]
+    fn remove_ttl_no_ttl_returns_false() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert!(!cache.remove_ttl("foo").unwrap());
+    }
+
+    #[test]
+    fn remove_ttl_missing_key_returns_false() {
+        let cache = Cache::default();
+        assert!(!cache.remove_ttl("missing").unwrap());
+    }
+
+    #[test]
+    fn remove_ttl_keeps_value_intact() {
+        let cache = Cache::default();
+        cache
+            .insert("foo", Entry::new("bar", Some(now() + 100)))
+            .unwrap();
+        cache.remove_ttl("foo").unwrap();
+        assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("bar", None)));
+    }
+
+    // ---------- remove_expired ----------
+
+    #[test]
+    fn remove_expired_empty_returns_zero() {
+        let cache = Cache::default();
+        assert_eq!(cache.remove_expired().unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_expired_drops_expired_keys() {
+        let cache = Cache::default();
+        cache.insert("a", Entry::new("v", Some(1))).unwrap();
+        cache.insert("b", Entry::new("v", Some(1))).unwrap();
+        assert_eq!(cache.remove_expired().unwrap(), 2);
+        assert!(!cache.contains("a").unwrap());
+        assert!(!cache.contains("b").unwrap());
+    }
+
+    #[test]
+    fn remove_expired_keeps_future_keys() {
+        let cache = Cache::default();
+        cache
+            .insert("a", Entry::new("v", Some(now() + 3600)))
+            .unwrap();
+        assert_eq!(cache.remove_expired().unwrap(), 0);
+        assert!(cache.contains("a").unwrap());
+    }
+
+    #[test]
+    fn remove_expired_keeps_no_ttl_keys() {
+        let cache = Cache::default();
+        cache.insert("a", Entry::new("v", None)).unwrap();
+        assert_eq!(cache.remove_expired().unwrap(), 0);
+        assert!(cache.contains("a").unwrap());
+    }
+
+    #[test]
+    fn remove_expired_mixed() {
+        let cache = Cache::default();
+        cache.insert("expired_a", Entry::new("v", Some(1))).unwrap();
+        cache.insert("expired_b", Entry::new("v", Some(1))).unwrap();
+        cache
+            .insert("future", Entry::new("v", Some(now() + 3600)))
+            .unwrap();
+        cache.insert("no_ttl", Entry::new("v", None)).unwrap();
+        assert_eq!(cache.remove_expired().unwrap(), 2);
+        assert!(!cache.contains("expired_a").unwrap());
+        assert!(!cache.contains("expired_b").unwrap());
+        assert!(cache.contains("future").unwrap());
+        assert!(cache.contains("no_ttl").unwrap());
+    }
+
+    // ---------- init / persist ----------
+
+    #[test]
+    fn init_nonexistent_path_returns_empty_cache() {
+        let tmp = TmpPath::new();
+        // File doesn't exist yet.
+        let cache = Cache::init(tmp.path()).unwrap();
+        assert_eq!(cache.get("anything").unwrap(), None);
+    }
+
+    #[test]
+    fn persist_then_init_round_trip() {
+        let tmp = TmpPath::new();
+        let cache = Cache::default();
+        cache
+            .insert("foo", Entry::new("bar", Some(now() + 3600)))
+            .unwrap();
+        cache.insert("baz", Entry::new("qux", None)).unwrap();
+        cache.persist(tmp.path()).unwrap();
+
+        let reloaded = Cache::init(tmp.path()).unwrap();
+        // get on `foo` may strip the TTL if it ticks past; query via get_absolute_ttl to be deterministic.
+        assert_eq!(reloaded.get("baz").unwrap(), Some(Entry::new("qux", None)));
+        assert!(matches!(
+            reloaded.get_absolute_ttl("foo").unwrap(),
+            Some(Some(_))
+        ));
+    }
+
+    #[test]
+    fn persist_empty_cache_then_init_returns_empty() {
+        let tmp = TmpPath::new();
+        Cache::default().persist(tmp.path()).unwrap();
+        let reloaded = Cache::init(tmp.path()).unwrap();
+        assert_eq!(reloaded.get("anything").unwrap(), None);
+    }
+
+    #[test]
+    fn persist_truncates_existing_file() {
+        let tmp = TmpPath::new();
+        let big = Cache::default();
+        for i in 0..10 {
+            big.insert(format!("k{}", i), Entry::new("v", None))
+                .unwrap();
+        }
+        big.persist(tmp.path()).unwrap();
+
+        let small = Cache::default();
+        small.insert("only", Entry::new("v", None)).unwrap();
+        small.persist(tmp.path()).unwrap();
+
+        let reloaded = Cache::init(tmp.path()).unwrap();
+        assert!(reloaded.contains("only").unwrap());
+        assert!(!reloaded.contains("k0").unwrap());
     }
 }

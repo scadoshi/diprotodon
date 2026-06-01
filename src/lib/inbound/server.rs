@@ -9,6 +9,7 @@ use std::{
 };
 
 const BIND_ADDRESS: &str = "127.0.0.1:3000";
+const CACHE_PATH: &str = "cache";
 
 pub struct Server;
 impl Server {
@@ -17,7 +18,7 @@ impl Server {
         listener.set_nonblocking(true)?;
         println!("listening on {}", BIND_ADDRESS);
 
-        let cache = Cache::init()?;
+        let cache = Cache::init(CACHE_PATH)?;
         cache.remove_expired()?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -27,7 +28,7 @@ impl Server {
 
         // persistence
         let cache_clone = cache.clone();
-        let persist = move || match cache_clone.persist() {
+        let persist = move || match cache_clone.persist(CACHE_PATH) {
             Ok(_) => println!("cache persisted"),
             Err(e) => eprintln!("failed to persist cache: {}", e),
         };
