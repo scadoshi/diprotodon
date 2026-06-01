@@ -8,17 +8,16 @@ This file tracks where the project actually is — milestone status, decisions m
 
 **Graceful shutdown complete.** `Arc<AtomicBool>` shutdown flag, `TcpListener::set_nonblocking(true)` + 50ms throttle on `WouldBlock`, stdin EOF / "quit" / "exit" trigger shutdown, all spawned threads (persistence + sweeper + per-client) are collected via `JoinHandle` and joined cleanly before `Server::run` returns. Persistence and sweeper threads cooperate with the flag via short-tick (100ms × 100) sleep loops so shutdown latency is bounded.
 
-**Testing posture.** Frame parser, Command-from-Frame, Reply serializer, Crlf, and SessionReader all have unit tests. Every error path on every command has explicit coverage in `inbound/resp/command.rs` (TooManyParts, NotEnoughParts, UnexpectedFrame, Utf8/ParseInt for EXPIRE's ttl). Domain `Command` has constructor tests. The `get_key`/`get_value`/`get_ttl` getter methods on `Command` were dropped — pattern matching at the use site is the idiomatic accessor; getters returned statically-impossible `None`s for most variants.
+**Testing posture.** 137 unit tests passing. Frame parser, Command-from-Frame, Reply serializer, Crlf, and SessionReader all have unit tests. `Cache` has its own comprehensive unit suite (every public method, including lazy-expiry + init/persist round-trip via a `TmpPath` drop-cleanup helper — no `tempfile` crate). Every error path on every command has explicit coverage in `inbound/resp/command.rs` (TooManyParts, NotEnoughParts, UnexpectedFrame, Utf8/ParseInt for EXPIRE/EXPIREAT ttl). Tests grouped under `// ---------- name ----------` section headers by command/method for navigability. Domain `Command` has constructor tests. The `get_key`/`get_value`/`get_ttl` getter methods on `Command` were dropped — pattern matching at the use site is the idiomatic accessor; getters returned statically-impossible `None`s for most variants.
 
 **Strategic phase shift.** From here forward, work is allocated by *what's novel vs. what's rehearsed*, not by milestone order. The user has already shipped LSM-style persistence (WAL + memtable + SSTable + compaction + bloom filters) in `~/Projects/nighthawk`. That makes append-only-log mechanics rehearsed muscle — AI-assisted is fine. The unrehearsed pieces (pub/sub fan-out, async migration) get hand-written.
 
 ## Testing next up
 
-Before AOF, close these test gaps:
-- **`Session::execute` per-variant** — Vec<u8> writer + real Cache, assert exact RESP bytes for each Command variant (GET hit/miss, SET, DEL hit/miss, PING).
+- ~~**`Cache` unit tests**~~ — done. Every public method covered; lazy-expiry, expired-removal, past-TTL semantics, remove-expired bulk, init/persist round-trip.
+- ~~**`Cache::init` / `persist` testing**~~ — done; path is now `impl Into<PathBuf>` on both, threaded through `Server::run` via a `CACHE_PATH` const in `server.rs`. `TmpPath` test helper handles unique-path + cleanup without a crate.
+- **`Session::execute` per-variant** — Vec<u8> writer + real Cache, assert exact RESP bytes for each Command variant (GET hit/miss, SET, DEL hit/miss, PING with/without message, EXPIRE/EXPIREAT/TTL/PERSIST).
 - **End-to-end `repl`** — Cursor of scripted RESP request bytes as R, Vec<u8> as W, assert exact response bytes. Two tests: happy multi-command flow ending in clean disconnect, and bad-command-mid-stream proving the session continues after a SimpleError.
-- **`Cache` unit tests** — `Cache::default()` unlocks these. get hit/miss, set new/existing, delete hit/miss. Pure, no disk.
-- **`Cache::init` / `persist`** — needs `CACHE_PATH` to become a parameter (or `tempfile` crate). Separate refactor, can wait.
 
 ## Status by milestone
 
@@ -46,12 +45,13 @@ Before AOF, close these test gaps:
 - More commands (INCR, DECR, MGET, APPEND, STRLEN, etc.) deliberately deferred — proven extensible, marginal learning per new arm
 
 ### M3 — EXPIRE / EXPIREAT / TTL / PERSIST ✅
-- [x] Track per-key expiry timestamps — sidecar map (`expiries: HashMap<Vec<u8>, u64>` of absolute UNIX seconds), chosen over inline `(Value, Option<Instant>)` so keys without TTL pay zero overhead. `SystemTime`-based absolute seconds on disk over `Instant` because `Instant` is process-local and unserializable by design.
-- [x] Single mutex over both `values` and `expiries` (one `Inner` struct) — no deadlock-via-ordering risk, sweep is small.
+- [x] Track per-key expiry timestamps — unified `Entry { value: Vec<u8>, absolute_ttl: Option<u64> }` (absolute UNIX seconds). Iterated through two shapes: first inline `(Value, Option<Instant>)`, then sidecar `HashMap<Vec<u8>, u64>`, finally collapsed into a single `Entry` struct because perf gains from sidecar-for-low-TTL-usage didn't matter at this scale and the unified shape is simpler. `SystemTime`-based absolute seconds on disk over `Instant` because `Instant` is process-local and unserializable by design.
+- [x] Single mutex over the `HashMap<Vec<u8>, Entry>` — no deadlock-via-ordering risk, sweep is small.
 - [x] Relative + absolute TTL APIs (`set_relative_ttl`, `set_absolute_ttl`, `get_relative_ttl`, `get_absolute_ttl`, `remove_ttl`). EXPIRE feeds into relative; EXPIREAT feeds into absolute directly. Semantics mirror real Redis.
 - [x] Lazy expiration on read — `get`, `contains`, `get_absolute_ttl` all drop expired keys on access so clients never see them between sweeps.
 - [x] Active background sweep — `Cache::remove_expired()` plus a dedicated sweeper thread in `server.rs`. Hold-the-lock pattern (not snapshot) — defended for current scale because sweep is microseconds; would switch to snapshot+re-check if profiling showed tail-latency hurt.
 - [x] Past-timestamp absolute TTL → immediate removal, return `1` if key existed. Matches real Redis EXPIREAT semantics; clients don't need to wrap calls in clock checks.
+- [x] Insert of an "already expired" Entry is accepted (no clock check at the boundary). The next read removes it lazily — consistent with the rest of the expiry model. Real Redis does the same.
 - [x] TTL command returns `:-2` for missing, `:-1` for no-TTL, `:n` for seconds remaining.
 
 ### M4 — Persistence 🟡 (snapshot exists; AOF is the upgrade target)
@@ -59,6 +59,7 @@ Before AOF, close these test gaps:
 - [x] Truncate + create file on persist
 - [x] Lock released before disk I/O (drop guard before file ops)
 - [x] Persist task loops on a 10s interval (server.rs)
+- [x] Path is now `impl Into<PathBuf>` on both `init` and `persist`; the `CACHE_PATH` const lives in `server.rs` so the cache itself is agnostic. Unblocks multi-instance servers and trivial test isolation.
 - [x] **Decision: move to AOF** — LSM (nighthawk's approach) is rejected here; Redis is in-memory-first, AOF matches the semantic.
 - [ ] **AOF write path** — append every state-mutating command (SET, DEL, eventually EXPIRE) to a log file. `fsync` on each write (or buffered with configurable durability).
 - [ ] **AOF replay on startup** — replay the log to rebuild the in-memory state.
@@ -87,7 +88,7 @@ This is the strategic split going forward. The user has already shipped LSM pers
 
 ### Worth hand-writing (novel muscle)
 
-- **TTL / EXPIRE / active sweep (M3)** — ✅ done. Sidecar expiry map, lazy + active expiry, hold-the-lock sweep (defensible at current scale; would switch to snapshot+re-check under load).
+- **TTL / EXPIRE / active sweep (M3)** — ✅ done. Unified `Entry { value, absolute_ttl }`, lazy expiry on every read path + active sweep (hold-the-lock — defensible at current scale; would switch to snapshot+re-check under load).
 - **Graceful shutdown** — ✅ done. `Arc<AtomicBool>` + nonblocking listener + stdin-EOF/quit trigger + JoinHandle collection and join on exit.
 - **AOF rewrite/compaction design** — the *consistent-snapshot-without-blocking-writers* problem is still novel. Sketch the algorithm by hand (fork+COW vs. clone-the-HashMap vs. copy-on-write structures, how to buffer concurrent writes during rewrite, atomic swap at the end) before writing code. The snapshot strategy is the interesting bit; file mechanics are mechanical.
 - **Async/tokio migration** — paradigm shift, not a feature. Hand-write to feel the model and to have the lived sync→async rewrite experience.
