@@ -127,12 +127,27 @@ impl<R: Read, W: Write> Session<R, W> {
                 }
             }
             Command::Set { key, value } => {
-                self.cache.set(key.as_slice(), value.as_slice())?;
+                self.cache.insert(key.as_slice(), value.as_slice())?;
                 Reply::SimpleString(SimpleInner::ok())
             }
-            Command::Delete { key } => Reply::Integer(self.cache.delete(&key)?.is_some() as i64),
-            Command::Ping => Reply::SimpleString(SimpleInner::pong()),
-            Command::Exists { key } => Reply::Integer(self.cache.exists(&key)? as i64),
+            Command::Delete { key } => Reply::Integer(self.cache.remove(&key)?.is_some() as i64),
+            Command::Ping {
+                message: Some(message),
+            } => Reply::BulkString(message),
+            Command::Ping { message: None } => Reply::SimpleString(SimpleInner::pong()),
+            Command::Exists { key } => Reply::Integer(self.cache.contains(&key)? as i64),
+            Command::Expire { key, relative_ttl } => {
+                Reply::Integer(self.cache.set_relative_ttl(&key, relative_ttl)? as i64)
+            }
+            Command::ExpireAt { key, absolute_ttl } => {
+                Reply::Integer(self.cache.set_absolute_ttl(&key, absolute_ttl)? as i64)
+            }
+            Command::TTL { key } => Reply::Integer(match self.cache.get_relative_ttl(&key)? {
+                None => -2,
+                Some(None) => -1,
+                Some(Some(ttl)) => i64::try_from(ttl).unwrap_or(i64::MAX),
+            }),
+            Command::Persist { key } => Reply::Integer(self.cache.remove_ttl(&key)? as i64),
         };
         reply.write_to(&mut self.writer)?;
         self.writer.flush()?;

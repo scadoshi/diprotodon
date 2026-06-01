@@ -18,9 +18,13 @@ impl Server {
         println!("listening on {}", BIND_ADDRESS);
 
         let cache = Cache::init()?;
+        cache.remove_expired()?;
+
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut id = 0;
+
         let mut handles = Vec::<JoinHandle<()>>::new();
+
         // persistence
         let cache_clone = cache.clone();
         let persist = move || match cache_clone.persist() {
@@ -40,7 +44,8 @@ impl Server {
                 persist();
             }
         }));
-        // shutdown signaling
+
+        // shutdown
         let shutdown_clone = shutdown.clone();
         handles.push(spawn(move || {
             let mut s = String::new();
@@ -59,7 +64,28 @@ impl Server {
                 }
             }
         }));
-        // main loop
+
+        // ttl
+        let cache_clone = cache.clone();
+        let remove_expired = move || match cache_clone.remove_expired() {
+            Ok(expired) => println!("{} expired keys removed", expired),
+            Err(e) => eprintln!("failed to remove expired keys: {}", e),
+        };
+        let shutdown_clone = shutdown.clone();
+        handles.push(spawn(move || {
+            loop {
+                for _ in 0..100 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if shutdown_clone.load(Ordering::Relaxed) {
+                        remove_expired();
+                        return;
+                    }
+                }
+                remove_expired();
+            }
+        }));
+
+        // main
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 break;

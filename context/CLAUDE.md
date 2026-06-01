@@ -17,7 +17,7 @@ Phased milestones (full detail in `context/plan.md`):
 - **M0** — TCP echo server (sync threads first; async migration owed)
 - **M1** — RESP parser + PING/PONG
 - **M2** — GET / SET / DEL / EXISTS
-- **M3** — EXPIRE / TTL / PEXPIRE (lazy + active sweep)
+- **M3** — EXPIRE / EXPIREAT / TTL / PERSIST (lazy + active sweep)
 - **M4** — AOF persistence (append-only log, replay on boot)
 - **M5** — Pub/Sub (broadcast fan-out)
 - **M6 (stretch)** — RDB snapshots, MULTI/EXEC, Streams, RESP3

@@ -14,4 +14,4 @@ path = "src/lib/lib.rs"
 [dependencies]
 anyhow = "1.0.102"
 thiserror = "2.0.18"
-wincode = "0.5.3"
+wincode = { version = "0.5.3", features = ["derive"] }

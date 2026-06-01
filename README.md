@@ -2,7 +2,7 @@
 
 A minimal Redis-compatible in-memory key-value server in Rust. Hand-written from the wire protocol up.
 
-Speaks RESP over TCP. Real `redis-cli` clients can connect, ping, get, set, delete, and check key existence against it.
+Speaks RESP over TCP. Real `redis-cli` clients can connect, ping, get, set, delete, check key existence, set relative or absolute TTLs, query TTLs, and persist keys against it. Graceful shutdown via stdin EOF or `quit`/`exit`.
 
 ## Why "diprotodon"
 
@@ -13,11 +13,12 @@ The diprotodon was a giant marsupial — basically a hippo-sized wombat — that
 | Milestone | State |
 | --- | --- |
 | M0 — TCP echo server | done |
-| M1 — RESP protocol + dispatch | done (PING, framing, error replies) |
+| M1 — RESP protocol + dispatch | done (PING with optional message echo, framing, error replies) |
 | M2 — GET / SET / DEL / EXISTS | done |
-| M3 — EXPIRE / TTL | not started |
+| M3 — EXPIRE / EXPIREAT / TTL / PERSIST | done (lazy + active expiry) |
 | M4 — AOF persistence | snapshot exists; AOF is the upgrade target |
 | M5 — Pub/Sub | not started |
+| Cross-cutting — graceful shutdown | done |
 
 Try it:
 
@@ -25,11 +26,18 @@ Try it:
 cargo run
 # in another terminal
 redis-cli -p 3000 ping
+redis-cli -p 3000 ping "hello"
 redis-cli -p 3000 set foo bar
 redis-cli -p 3000 get foo
 redis-cli -p 3000 exists foo
+redis-cli -p 3000 expire foo 30
+redis-cli -p 3000 expireat foo 1893456000
+redis-cli -p 3000 ttl foo
+redis-cli -p 3000 persist foo
 redis-cli -p 3000 del foo
 ```
+
+To shut down cleanly, send EOF (Ctrl-D) or type `quit` / `exit` on the server's stdin. The accept loop stops, persistence flushes one last time, and all spawned threads join before `main` returns.
 
 ## What's interesting in here
 
@@ -39,6 +47,9 @@ redis-cli -p 3000 del foo
 - **Hexagonal layout.** `src/lib/{domain,inbound,outbound}/` — wire-protocol code is one-way coupled to domain types, not the other way around.
 - **Generic Session.** `Session<R: Read, W: Write>` so the connection loop can be tested with `Cursor<Vec<u8>>` instead of a real TCP socket.
 - **Iterative array parsing.** Recursive `parse_array` would blow the stack on `MGET key1..key1000`. Iterative loop with a Vec is one extra concept and zero stack-overflow risk.
+- **TTL design.** Sidecar `HashMap<Vec<u8>, u64>` of absolute UNIX seconds rather than inlining `(value, Option<Instant>)` per entry — keys without a TTL pay zero overhead. `SystemTime`-based absolute seconds on disk because `Instant` is process-local and unserializable by design. EXPIRE (relative seconds-from-now) feeds through the same absolute representation; EXPIREAT (absolute UNIX seconds) sets it directly — a past timestamp deletes immediately and returns `1`, matching real Redis. Lazy expiry on every read path drops expired keys on access; a background sweeper thread does active eviction on a 10s tick. Single mutex over `values` and `expiries` so there's no lock-ordering risk.
+- **Graceful shutdown.** `Arc<AtomicBool>` shutdown flag. The listener is set non-blocking with a 50ms throttle on `WouldBlock` so the accept loop polls the flag without burning CPU. Stdin EOF / `quit` / `exit` flip the flag — no `ctrlc` crate dependency. Every spawned thread is collected as a `JoinHandle` and joined cleanly before `main` returns; the persistence and sweeper threads check the flag on a 100ms-tick budget so shutdown latency stays bounded.
+- **Error-path test coverage.** Every command's parser arm has explicit coverage for `TooManyParts`, `NotEnoughParts`, `UnexpectedFrame`, and (where applicable) `Utf8` / `ParseInt` failures on numeric args.
 
 ## Layout
 
@@ -48,10 +59,10 @@ src/
   lib/
     lib.rs             # module roots
     domain/
-      cache.rs         # Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>
-      command.rs       # Command enum (GET/SET/DEL/EXISTS/PING)
+      cache.rs         # Arc<Mutex<Inner { values, expiries }>>, lazy expiry, sweep
+      command.rs       # Command enum (GET/SET/DEL/EXISTS/PING/EXPIRE/EXPIREAT/TTL/PERSIST)
     inbound/
-      server.rs        # TCP accept loop, thread-per-connection
+      server.rs        # TCP accept loop, thread-per-connection, sweeper + persistence + shutdown threads
       session.rs       # per-connection REPL + SessionReader (frame buf)
       resp/
         crlf.rs        # Crlf trait on [u8] — is_crlf / split_crlf

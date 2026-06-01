@@ -1,3 +1,4 @@
+use std::{num::ParseIntError, str::Utf8Error};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -8,6 +9,10 @@ pub enum CommandError {
     NotEnoughParts,
     #[error("too many parts")]
     TooManyParts,
+    #[error(transparent)]
+    Utf8(#[from] Utf8Error),
+    #[error(transparent)]
+    ParseInt(#[from] ParseIntError),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,40 +20,58 @@ pub enum Command {
     Get { key: Vec<u8> },
     Set { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
-    Ping,
+    Ping { message: Option<Vec<u8>> },
     Exists { key: Vec<u8> },
+    Expire { key: Vec<u8>, relative_ttl: u64 },
+    ExpireAt { key: Vec<u8>, absolute_ttl: u64 },
+    TTL { key: Vec<u8> },
+    Persist { key: Vec<u8> },
 }
 
 impl Command {
     pub fn get(key: impl Into<Vec<u8>>) -> Self {
         Self::Get { key: key.into() }
     }
+
     pub fn set(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
         Self::Set {
             key: key.into(),
             value: value.into(),
         }
     }
+
     pub fn delete(key: impl Into<Vec<u8>>) -> Self {
         Self::Delete { key: key.into() }
     }
+
+    pub fn ping(message: Option<Vec<u8>>) -> Self {
+        Self::Ping { message }
+    }
+
     pub fn exists(key: impl Into<Vec<u8>>) -> Self {
         Self::Exists { key: key.into() }
     }
-    pub fn key(&self) -> Option<&[u8]> {
-        match self {
-            Self::Get { key }
-            | Self::Set { key, .. }
-            | Self::Delete { key }
-            | Self::Exists { key } => Some(key),
-            Self::Ping => None,
+
+    pub fn expire(key: impl Into<Vec<u8>>, relative_ttl: u64) -> Self {
+        Self::Expire {
+            key: key.into(),
+            relative_ttl,
         }
     }
-    pub fn value(&self) -> Option<&[u8]> {
-        match self {
-            Self::Get { .. } | Self::Delete { .. } | Self::Ping | Self::Exists { .. } => None,
-            Self::Set { value, .. } => Some(value),
+
+    pub fn expire_at(key: impl Into<Vec<u8>>, absolute_ttl: u64) -> Self {
+        Self::ExpireAt {
+            key: key.into(),
+            absolute_ttl,
         }
+    }
+
+    pub fn ttl(key: impl Into<Vec<u8>>) -> Self {
+        Self::TTL { key: key.into() }
+    }
+
+    pub fn persist(key: impl Into<Vec<u8>>) -> Self {
+        Self::Persist { key: key.into() }
     }
 }
 
@@ -59,9 +82,9 @@ mod tests {
     #[test]
     fn get_constructor() {
         assert_eq!(
-            Command::get("key"),
+            Command::get("foo"),
             Command::Get {
-                key: b"key".to_vec()
+                key: b"foo".to_vec()
             }
         );
     }
@@ -69,10 +92,10 @@ mod tests {
     #[test]
     fn set_constructor() {
         assert_eq!(
-            Command::set("key", "value"),
+            Command::set("foo", "bar"),
             Command::Set {
-                key: b"key".to_vec(),
-                value: b"value".to_vec(),
+                key: b"foo".to_vec(),
+                value: b"bar".to_vec(),
             }
         );
     }
@@ -80,9 +103,24 @@ mod tests {
     #[test]
     fn delete_constructor() {
         assert_eq!(
-            Command::delete("key"),
+            Command::delete("foo"),
             Command::Delete {
-                key: b"key".to_vec()
+                key: b"foo".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn ping_constructor_without_message() {
+        assert_eq!(Command::ping(None), Command::Ping { message: None });
+    }
+
+    #[test]
+    fn ping_constructor_with_message() {
+        assert_eq!(
+            Command::ping(Some(b"hello".to_vec())),
+            Command::Ping {
+                message: Some(b"hello".to_vec())
             }
         );
     }
@@ -90,63 +128,52 @@ mod tests {
     #[test]
     fn exists_constructor() {
         assert_eq!(
-            Command::exists("key"),
+            Command::exists("foo"),
             Command::Exists {
-                key: b"key".to_vec()
+                key: b"foo".to_vec()
             }
         );
     }
 
     #[test]
-    fn key_get() {
-        assert_eq!(Command::get("key").key(), Some(b"key".as_slice()));
-    }
-
-    #[test]
-    fn key_set() {
-        assert_eq!(Command::set("key", "value").key(), Some(b"key".as_slice()));
-    }
-
-    #[test]
-    fn key_delete() {
-        assert_eq!(Command::delete("key").key(), Some(b"key".as_slice()));
-    }
-
-    #[test]
-    fn key_exists() {
-        assert_eq!(Command::exists("key").key(), Some(b"key".as_slice()));
-    }
-
-    #[test]
-    fn key_ping() {
-        assert_eq!(Command::Ping.key(), None);
-    }
-
-    #[test]
-    fn value_get() {
-        assert_eq!(Command::get("key").value(), None);
-    }
-
-    #[test]
-    fn value_set() {
+    fn expire_constructor() {
         assert_eq!(
-            Command::set("key", "value").value(),
-            Some(b"value".as_slice())
+            Command::expire("foo", 123),
+            Command::Expire {
+                key: b"foo".to_vec(),
+                relative_ttl: 123
+            }
         );
     }
 
     #[test]
-    fn value_delete() {
-        assert_eq!(Command::delete("key").value(), None);
+    fn expire_at_constructor() {
+        assert_eq!(
+            Command::expire_at("foo", 1_700_000_000),
+            Command::ExpireAt {
+                key: b"foo".to_vec(),
+                absolute_ttl: 1_700_000_000
+            }
+        );
     }
 
     #[test]
-    fn value_ping() {
-        assert_eq!(Command::Ping.value(), None);
+    fn ttl_constructor() {
+        assert_eq!(
+            Command::ttl("foo"),
+            Command::TTL {
+                key: b"foo".to_vec()
+            }
+        );
     }
 
     #[test]
-    fn value_exists() {
-        assert_eq!(Command::exists("key").value(), None);
+    fn persist_constructor() {
+        assert_eq!(
+            Command::persist("foo"),
+            Command::Persist {
+                key: b"foo".to_vec()
+            }
+        );
     }
 }
