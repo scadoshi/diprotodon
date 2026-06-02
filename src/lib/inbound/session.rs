@@ -17,7 +17,7 @@ use crate::{
     outbound::resp::reply::{Reply, SimpleInner},
 };
 use std::{
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, BufWriter, ErrorKind, Read, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -146,7 +146,6 @@ impl<R: Read, W: Write> Session<R, W> {
     pub fn get_command(&mut self) -> std::io::Result<Option<Command>> {
         loop {
             let frame = self.get_frame()?;
-
             match frame {
                 Some(frame) => match Command::try_from(frame) {
                     Ok(cmd) => return Ok(Some(cmd)),
@@ -213,16 +212,19 @@ impl<R: Read, W: Write> Session<R, W> {
     /// the "Connection lifecycle" section of `context/plan.md`).
     pub fn repl(&mut self, shutdown_signal: Arc<AtomicBool>) -> Result<(), ReplError> {
         loop {
-            let cmd = self.get_command()?;
-            match cmd {
-                Some(cmd) => self.execute(cmd)?,
-                None => {
+            if shutdown_signal.load(Ordering::Relaxed) {
+                break;
+            }
+            match self.get_command() {
+                Ok(Some(cmd)) => self.execute(cmd)?,
+                Ok(None) => {
                     println!("client {} disconnected", self.id);
                     break;
                 }
-            }
-            if shutdown_signal.load(Ordering::Relaxed) {
-                break;
+                Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(())

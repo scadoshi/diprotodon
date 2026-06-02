@@ -27,6 +27,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{JoinHandle, spawn},
+    time::Duration,
 };
 
 /// Address the server binds for client connections.
@@ -138,6 +139,11 @@ impl Server {
                                 return;
                             }
                         };
+                        if let Err(e) =
+                            reader_stream.set_read_timeout(Some(Duration::from_millis(500)))
+                        {
+                            eprintln!("failed to set stream read timeout: {}", e);
+                        }
                         let mut session =
                             Session::new(id, reader_stream, writer_stream, cache_clone);
                         match session.repl(shutdown_clone) {
