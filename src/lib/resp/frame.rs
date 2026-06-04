@@ -5,9 +5,11 @@
 //! That's the entire surface a client uses to send commands; outbound reply types
 //! (simple strings, errors, integers, null-bulk) live in the outbound layer.
 
-use crate::inbound::resp::crlf::Crlf;
-use std::{num::ParseIntError, str::Utf8Error};
+use crate::{domain::command::MutatingCommand, resp::crlf::Crlf};
+use std::{io::Write, num::ParseIntError, str::Utf8Error};
 use thiserror::Error;
+
+type IoError = std::io::Error;
 
 /// Errors returned by the frame parser.
 #[derive(Debug, Error)]
@@ -104,6 +106,56 @@ impl Frame {
             return Err(FrameError::MissingTerminator);
         }
         Ok((Frame::BulkString(bytes[0..len].to_vec()), &bytes[len + 2..]))
+    }
+
+    pub fn write_to(&self, w: &mut impl Write) -> Result<(), IoError> {
+        match self {
+            Self::Array(frames) => {
+                write!(w, "*{}", frames.len())?;
+                w.write_all(b"\r\n")?;
+                for f in frames {
+                    f.write_to(w)?;
+                }
+            }
+            Self::BulkString(str) => {
+                write!(w, "${}", str.len())?;
+                w.write_all(b"\r\n")?;
+                w.write_all(str)?;
+                w.write_all(b"\r\n")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+type MC = MutatingCommand;
+impl From<MC> for Frame {
+    fn from(value: MC) -> Self {
+        match value {
+            MC::Set { key, value } => Frame::Array(vec![
+                Frame::BulkString(b"SET".to_vec()),
+                Frame::BulkString(key),
+                Frame::BulkString(value),
+            ]),
+            MC::Delete { key } => Frame::Array(vec![
+                Frame::BulkString(b"DEL".to_vec()),
+                Frame::BulkString(key),
+            ]),
+            MC::Expire { key, relative_ttl } => Frame::Array(vec![
+                Frame::BulkString(b"EXPIRE".to_vec()),
+                Frame::BulkString(key),
+                Frame::BulkString(relative_ttl.to_string().as_bytes().to_vec()),
+            ]),
+            MC::ExpireAt { key, absolute_ttl } => Frame::Array(vec![
+                Frame::BulkString(b"EXPIREAT".to_vec()),
+                Frame::BulkString(key),
+                Frame::BulkString(absolute_ttl.to_string().as_bytes().to_vec()),
+            ]),
+            MC::Persist { key } => Frame::Array(vec![
+                Frame::BulkString(b"PERSIST".to_vec()),
+                Frame::BulkString(key),
+            ]),
+        }
     }
 }
 
@@ -230,5 +282,26 @@ mod tests {
             Frame::parse_one(b"$3\r\nfoo"),
             Err(FrameError::MissingTerminator)
         ));
+    }
+
+    #[test]
+    fn write_to_bulk_string() {
+        let mut buf = Vec::<u8>::new();
+        Frame::BulkString(b"foo".to_vec())
+            .write_to(&mut buf)
+            .unwrap();
+        assert_eq!(buf, b"$3\r\nfoo\r\n".to_vec(),);
+    }
+
+    #[test]
+    fn to_bytes_array() {
+        let mut buf = Vec::<u8>::new();
+        Frame::Array(vec![
+            Frame::BulkString(b"foo".to_vec()),
+            Frame::BulkString(b"bar".to_vec()),
+        ])
+        .write_to(&mut buf)
+        .unwrap();
+        assert_eq!(buf, b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n".to_vec(),);
     }
 }

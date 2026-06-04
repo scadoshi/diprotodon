@@ -125,6 +125,31 @@ impl Command {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum MutatingCommand {
+    Set { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+    Expire { key: Vec<u8>, relative_ttl: u64 },
+    ExpireAt { key: Vec<u8>, absolute_ttl: u64 },
+    Persist { key: Vec<u8> },
+}
+
+impl MutatingCommand {
+    pub fn from_command(command: Command) -> Option<Self> {
+        match command {
+            Command::Get { .. }
+            | Command::Ping { .. }
+            | Command::Exists { .. }
+            | Command::TTL { .. } => None,
+            Command::Set { key, value } => Some(Self::Set { key, value }),
+            Command::Delete { key } => Some(Self::Delete { key }),
+            Command::Expire { key, relative_ttl } => Some(Self::Expire { key, relative_ttl }),
+            Command::ExpireAt { key, absolute_ttl } => Some(Self::ExpireAt { key, absolute_ttl }),
+            Command::Persist { key } => Some(Self::Persist { key }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

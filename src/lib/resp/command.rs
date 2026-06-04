@@ -8,7 +8,7 @@
 
 use crate::{
     domain::command::{Command, CommandError},
-    inbound::resp::frame::Frame,
+    resp::frame::Frame,
 };
 use thiserror::Error;
 

@@ -13,8 +13,10 @@ use crate::{
         cache::{Cache, CacheError, Entry},
         command::Command,
     },
-    inbound::resp::frame::{Frame, FrameError},
-    outbound::resp::reply::{Reply, SimpleInner},
+    resp::{
+        frame::{Frame, FrameError},
+        reply::{Reply, SimpleInner},
+    },
 };
 use std::{
     io::{BufReader, BufWriter, ErrorKind, Read, Write},

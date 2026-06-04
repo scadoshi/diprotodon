@@ -23,9 +23,7 @@
 
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{Read, Write},
-    path::PathBuf,
+    ops::Deref,
     sync::{Arc, Mutex},
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
@@ -95,7 +93,18 @@ pub struct Cache {
     inner: Arc<Mutex<HashMap<Vec<u8>, Entry>>>,
 }
 
+impl Deref for Cache {
+    type Target = Arc<Mutex<HashMap<Vec<u8>, Entry>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl Cache {
+    pub fn new(inner: Arc<Mutex<HashMap<Vec<u8>, Entry>>>) -> Self {
+        Self { inner }
+    }
+
     /// Fetch a clone of the [`Entry`] for `key`, or `None` if missing or expired.
     ///
     /// If the entry exists but its `absolute_ttl` has passed, this returns `None` *and*
@@ -263,52 +272,6 @@ impl Cache {
         }
     }
 
-    /// Load a cache from a snapshot at `path`. A missing file is not an error —
-    /// returns an empty cache. Any other I/O error or a corrupt snapshot surfaces as
-    /// [`CacheError::Io`] / [`CacheError::Read`].
-    pub fn init(path: impl Into<PathBuf>) -> Result<Self, CacheError> {
-        let buf = match File::open(path.into()) {
-            Ok(mut file) => {
-                let mut buf = Vec::new();
-                file.read_to_end(&mut buf)?;
-                buf
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        let entries = if buf.is_empty() {
-            HashMap::new()
-        } else {
-            wincode::deserialize(&buf)?
-        };
-        Ok(Self {
-            inner: Arc::new(Mutex::new(entries)),
-        })
-    }
-
-    /// Write a `wincode`-serialized snapshot of the current map to `path`, truncating
-    /// any existing file.
-    ///
-    /// The lock is held only long enough to clone the inner map; serialization and
-    /// disk I/O run outside the critical section so writers aren't blocked on a slow
-    /// disk. Tradeoff: a writer that commits between clone and write_all isn't in the
-    /// snapshot — acceptable for periodic-snapshot durability semantics.
-    pub fn persist(&self, path: impl Into<PathBuf>) -> Result<(), CacheError> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| CacheError::MutexPoisoned)?
-            .to_owned();
-        let bytes = wincode::serialize(&inner)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(path.into())?;
-        file.write_all(&bytes)?;
-        Ok(())
-    }
-
     /// Sweep all expired entries. Returns the count of keys removed. Called by the
     /// background sweeper thread in `inbound::server` on a periodic tick.
     ///
@@ -333,7 +296,6 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     // ---------- helpers ----------
 
@@ -342,26 +304,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
-    }
-
-    /// A unique temp path that auto-cleans on drop.
-    struct TmpPath(PathBuf);
-    impl TmpPath {
-        fn new() -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            Self(std::env::temp_dir().join(format!("diprotodon-test-{}.cache", nanos)))
-        }
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-    impl Drop for TmpPath {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
     }
 
     // ---------- Entry ----------
@@ -751,61 +693,5 @@ mod tests {
         assert!(!cache.contains("expired_b").unwrap());
         assert!(cache.contains("future").unwrap());
         assert!(cache.contains("no_ttl").unwrap());
-    }
-
-    // ---------- init / persist ----------
-
-    #[test]
-    fn init_nonexistent_path_returns_empty_cache() {
-        let tmp = TmpPath::new();
-        // File doesn't exist yet.
-        let cache = Cache::init(tmp.path()).unwrap();
-        assert_eq!(cache.get("anything").unwrap(), None);
-    }
-
-    #[test]
-    fn persist_then_init_round_trip() {
-        let tmp = TmpPath::new();
-        let cache = Cache::default();
-        cache
-            .insert("foo", Entry::new("bar", Some(now() + 3600)))
-            .unwrap();
-        cache.insert("baz", Entry::new("qux", None)).unwrap();
-        cache.persist(tmp.path()).unwrap();
-
-        let reloaded = Cache::init(tmp.path()).unwrap();
-        // get on `foo` may strip the TTL if it ticks past; query via get_absolute_ttl to be deterministic.
-        assert_eq!(reloaded.get("baz").unwrap(), Some(Entry::new("qux", None)));
-        assert!(matches!(
-            reloaded.get_absolute_ttl("foo").unwrap(),
-            Some(Some(_))
-        ));
-    }
-
-    #[test]
-    fn persist_empty_cache_then_init_returns_empty() {
-        let tmp = TmpPath::new();
-        Cache::default().persist(tmp.path()).unwrap();
-        let reloaded = Cache::init(tmp.path()).unwrap();
-        assert_eq!(reloaded.get("anything").unwrap(), None);
-    }
-
-    #[test]
-    fn persist_truncates_existing_file() {
-        let tmp = TmpPath::new();
-        let big = Cache::default();
-        for i in 0..10 {
-            big.insert(format!("k{}", i), Entry::new("v", None))
-                .unwrap();
-        }
-        big.persist(tmp.path()).unwrap();
-
-        let small = Cache::default();
-        small.insert("only", Entry::new("v", None)).unwrap();
-        small.persist(tmp.path()).unwrap();
-
-        let reloaded = Cache::init(tmp.path()).unwrap();
-        assert!(reloaded.contains("only").unwrap());
-        assert!(!reloaded.contains("k0").unwrap());
     }
 }
