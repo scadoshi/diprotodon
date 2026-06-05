@@ -20,9 +20,9 @@
 //! burning a CPU when no clients are connecting.
 
 use crate::{
-    domain::cache::Cache,
+    domain::{cache::Cache, ports::CacheRepository, service::Service as CacheService},
     inbound::session::Session,
-    outbound::cache::{init::Init, persist::Persist},
+    outbound::persister::Persister,
 };
 use std::{
     net::TcpListener,
@@ -30,16 +30,12 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    thread::{JoinHandle, spawn},
+    thread::{JoinHandle, sleep, spawn},
     time::Duration,
 };
 
 /// Address the server binds for client connections.
 const BIND_ADDRESS: &str = "127.0.0.1:3000";
-/// On-disk path for the cache snapshot. Lives here (not in `cache.rs`) so the cache
-/// module stays I/O-policy-agnostic — `Cache::init` / `Cache::persist` both take an
-/// `impl Into<PathBuf>`.
-const CACHE_PATH: &str = "cache";
 
 /// Zero-sized handle exposing [`Server::run`]. The server itself is just a function;
 /// the struct exists so callers have a stable `Server::run` entry point.
@@ -51,30 +47,51 @@ impl Server {
     /// Returns `Err` only on a fatal setup error (bind failure, snapshot load failure).
     /// Per-connection or per-thread errors are logged but do not bubble out.
     pub fn run() -> anyhow::Result<()> {
-        let listener = TcpListener::bind(BIND_ADDRESS)?;
-        listener.set_nonblocking(true)?;
-        println!("listening on {}", BIND_ADDRESS);
-
-        let cache = Cache::init(CACHE_PATH)?;
+        let persister = Persister::initialize()?;
+        let cache = Cache::new(persister.snapshot.load()?);
+        persister.aof.replay(&cache)?;
         cache.remove_expired()?;
+
+        let cache_service = CacheService::new(cache.clone(), persister.clone());
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut id = 0;
 
         let mut handles = Vec::<JoinHandle<()>>::new();
 
+        // shutdown
+        let shutdown_trigger = shutdown.clone();
+        handles.push(spawn(move || {
+            let mut s = String::new();
+            loop {
+                s.clear();
+                match std::io::stdin().read_line(&mut s) {
+                    Ok(0) => {
+                        shutdown_trigger.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Ok(_) if matches!(s.trim().to_lowercase().as_str(), "quit" | "exit") => {
+                        shutdown_trigger.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    _ => (),
+                }
+            }
+        }));
+
         // persistence
-        let cache_clone = cache.clone();
-        let persist = move || match cache_clone.persist(CACHE_PATH) {
+        let persistence_cache = cache.clone();
+        let persist = move || match persister.snapshot(&persistence_cache) {
             Ok(_) => println!("cache persisted"),
             Err(e) => eprintln!("failed to persist cache: {}", e),
         };
-        let shutdown_clone = shutdown.clone();
+
+        let persistence_shutdown = shutdown.clone();
         handles.push(spawn(move || {
             loop {
                 for _ in 0..100 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if shutdown_clone.load(Ordering::Relaxed) {
+                    sleep(Duration::from_millis(100));
+                    if persistence_shutdown.load(Ordering::Relaxed) {
                         persist();
                         return;
                     }
@@ -83,38 +100,18 @@ impl Server {
             }
         }));
 
-        // shutdown
-        let shutdown_clone = shutdown.clone();
-        handles.push(spawn(move || {
-            let mut s = String::new();
-            loop {
-                s.clear();
-                match std::io::stdin().read_line(&mut s) {
-                    Ok(0) => {
-                        shutdown_clone.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    Ok(_) if matches!(s.trim().to_lowercase().as_str(), "quit" | "exit") => {
-                        shutdown_clone.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    _ => (),
-                }
-            }
-        }));
-
         // ttl
-        let cache_clone = cache.clone();
-        let remove_expired = move || match cache_clone.remove_expired() {
+        let sweeper_cache = cache.clone();
+        let remove_expired = move || match sweeper_cache.remove_expired() {
             Ok(expired) => println!("{} expired keys removed", expired),
             Err(e) => eprintln!("failed to remove expired keys: {}", e),
         };
-        let shutdown_clone = shutdown.clone();
+        let sweeper_shutdown = shutdown.clone();
         handles.push(spawn(move || {
             loop {
                 for _ in 0..100 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if shutdown_clone.load(Ordering::Relaxed) {
+                    sleep(Duration::from_millis(100));
+                    if sweeper_shutdown.load(Ordering::Relaxed) {
                         remove_expired();
                         return;
                     }
@@ -124,6 +121,9 @@ impl Server {
         }));
 
         // main
+        let listener = TcpListener::bind(BIND_ADDRESS)?;
+        listener.set_nonblocking(true)?;
+        println!("listening on {}", BIND_ADDRESS);
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 break;
@@ -131,10 +131,10 @@ impl Server {
             handles.retain(|t| !t.is_finished());
             match listener.accept() {
                 Ok((writer_stream, _)) => {
-                    let cache_clone = cache.clone();
                     let shutdown_clone = shutdown.clone();
                     id += 1;
                     println!("client number {} connected", id);
+                    let cache_service_clone = cache_service.clone();
                     handles.push(spawn(move || {
                         let reader_stream = match writer_stream.try_clone() {
                             Ok(stream) => stream,
@@ -149,7 +149,7 @@ impl Server {
                             eprintln!("failed to set stream read timeout: {}", e);
                         }
                         let mut session =
-                            Session::new(id, reader_stream, writer_stream, cache_clone);
+                            Session::new(id, reader_stream, writer_stream, cache_service_clone);
                         match session.repl(shutdown_clone) {
                             Ok(_) => (),
                             Err(e) => eprintln!("failed to repl: {}", e),

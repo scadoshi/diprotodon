@@ -1,5 +1,4 @@
-//! In-memory key-value store with TTL support, snapshot persistence, and lazy + active
-//! expiry.
+//! In-memory key-value store with TTL support and lazy + active expiry.
 //!
 //! [`Cache`] is the only type a caller needs. It wraps `Arc<Mutex<HashMap<Vec<u8>, Entry>>>`
 //! so handles are cheap to clone across threads and the underlying map is shared. Every
@@ -17,10 +16,11 @@
 //!
 //! ## Persistence
 //!
-//! [`Cache::init`] and [`Cache::persist`] take an `impl Into<PathBuf>` so callers control
-//! where the snapshot lives. The on-disk format is `wincode`-serialized
-//! `HashMap<Vec<u8>, Entry>`; no path constant is baked into this module.
+//! The cache itself is purely in-memory and has no persistence methods. Durability lives
+//! in the outbound persister (`outbound::persister`): a `wincode`-serialized snapshot of
+//! the `HashMap<Vec<u8>, Entry>` plus an append-only command log replayed on startup.
 
+use crate::domain::command::{Command, CommandOutcome, TtlOutcome};
 use std::{
     collections::HashMap,
     ops::Deref,
@@ -28,20 +28,13 @@ use std::{
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 use thiserror::Error;
-use wincode::{ReadError, SchemaRead, SchemaWrite, WriteError};
+use wincode::{SchemaRead, SchemaWrite};
+
+type CO = CommandOutcome;
 
 /// Errors a [`Cache`] operation can return.
 #[derive(Debug, Error)]
 pub enum CacheError {
-    /// Filesystem I/O failure during snapshot load or persist.
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    /// Snapshot deserialization failed (likely a corrupt or incompatible file).
-    #[error(transparent)]
-    Read(#[from] ReadError),
-    /// Snapshot serialization failed.
-    #[error(transparent)]
-    Write(#[from] WriteError),
     /// The shared mutex was poisoned by a thread that panicked while holding it.
     /// Poisoning means the in-memory state may be inconsistent; the cache cannot be
     /// safely used after this.
@@ -86,8 +79,8 @@ impl Entry {
 /// sweeper, and persistence loop.
 ///
 /// `Default` yields an empty in-memory cache backed by a fresh `Arc<Mutex<…>>`; use it
-/// for tests or for callers that don't want snapshot persistence. Use [`Cache::init`]
-/// to load from disk.
+/// for tests. To rebuild from disk, construct via [`Cache::new`] with a snapshot-loaded
+/// map and replay the log through the outbound persister.
 #[derive(Clone, Debug, Default)]
 pub struct Cache {
     inner: Arc<Mutex<HashMap<Vec<u8>, Entry>>>,
@@ -101,8 +94,10 @@ impl Deref for Cache {
 }
 
 impl Cache {
-    pub fn new(inner: Arc<Mutex<HashMap<Vec<u8>, Entry>>>) -> Self {
-        Self { inner }
+    pub fn new(data: HashMap<Vec<u8>, Entry>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(data)),
+        }
     }
 
     /// Fetch a clone of the [`Entry`] for `key`, or `None` if missing or expired.
@@ -290,6 +285,38 @@ impl Cache {
             guard.remove(key);
         }
         Ok(expired.len())
+    }
+
+    pub fn execute(&self, command: Command) -> Result<CommandOutcome, CacheError> {
+        let outcome = match command {
+            Command::Get { key } => {
+                let value = self.get(&key)?;
+                match value {
+                    Some(Entry { value, .. }) => CommandOutcome::Value(Some(value)),
+                    None => CommandOutcome::Value(None),
+                }
+            }
+            Command::Set { key, value } => {
+                self.insert(key.as_slice(), Entry::new(value.as_slice(), None))?;
+                CO::Ok
+            }
+            Command::Delete { key } => CO::Bool(self.remove(&key)?.is_some()),
+            Command::Ping { message } => CO::Pong(message),
+            Command::Exists { key } => CO::Integer(self.contains(&key)? as i64),
+            Command::Expire { key, relative_ttl } => {
+                CO::Bool(self.set_relative_ttl(&key, relative_ttl)?)
+            }
+            Command::ExpireAt { key, absolute_ttl } => {
+                CO::Bool(self.set_absolute_ttl(&key, absolute_ttl)?)
+            }
+            Command::Ttl { key } => CO::Ttl(match self.get_relative_ttl(&key)? {
+                None => TtlOutcome::KeyNotFound,
+                Some(None) => TtlOutcome::TtlNotFound,
+                Some(Some(ttl)) => TtlOutcome::Some(ttl),
+            }),
+            Command::Persist { key } => CO::Bool(self.remove_ttl(&key)?),
+        };
+        Ok(outcome)
     }
 }
 
@@ -677,6 +704,218 @@ mod tests {
         cache.insert("a", Entry::new("v", None)).unwrap();
         assert_eq!(cache.remove_expired().unwrap(), 0);
         assert!(cache.contains("a").unwrap());
+    }
+
+    // ---------- execute ----------
+
+    #[test]
+    fn execute_get_miss_returns_value_none() {
+        let cache = Cache::default();
+        assert!(matches!(
+            cache.execute(Command::get("missing")).unwrap(),
+            CommandOutcome::Value(None)
+        ));
+    }
+
+    #[test]
+    fn execute_get_hit_returns_value_some() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        match cache.execute(Command::get("foo")).unwrap() {
+            CommandOutcome::Value(Some(v)) => assert_eq!(v, b"bar".to_vec()),
+            other => panic!("expected Value(Some), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_get_expired_returns_value_none() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", Some(1))).unwrap();
+        assert!(matches!(
+            cache.execute(Command::get("foo")).unwrap(),
+            CommandOutcome::Value(None)
+        ));
+    }
+
+    #[test]
+    fn execute_set_returns_ok_and_inserts() {
+        let cache = Cache::default();
+        assert!(matches!(
+            cache.execute(Command::set("foo", "bar")).unwrap(),
+            CommandOutcome::Ok
+        ));
+        assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("bar", None)));
+    }
+
+    #[test]
+    fn execute_set_overwrites() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("old", None)).unwrap();
+        cache.execute(Command::set("foo", "new")).unwrap();
+        assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("new", None)));
+    }
+
+    #[test]
+    fn execute_delete_hit_returns_bool_true() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert!(matches!(
+            cache.execute(Command::delete("foo")).unwrap(),
+            CommandOutcome::Bool(true)
+        ));
+        assert!(!cache.contains("foo").unwrap());
+    }
+
+    #[test]
+    fn execute_delete_miss_returns_bool_false() {
+        let cache = Cache::default();
+        assert!(matches!(
+            cache.execute(Command::delete("missing")).unwrap(),
+            CommandOutcome::Bool(false)
+        ));
+    }
+
+    #[test]
+    fn execute_ping_without_message_returns_pong_none() {
+        let cache = Cache::default();
+        assert!(matches!(
+            cache.execute(Command::ping(None)).unwrap(),
+            CommandOutcome::Pong(None)
+        ));
+    }
+
+    #[test]
+    fn execute_ping_with_message_returns_pong_some() {
+        let cache = Cache::default();
+        match cache.execute(Command::ping(Some(b"hi".to_vec()))).unwrap() {
+            CommandOutcome::Pong(Some(m)) => assert_eq!(m, b"hi".to_vec()),
+            other => panic!("expected Pong(Some), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_exists_hit_returns_integer_one() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert!(matches!(
+            cache.execute(Command::exists("foo")).unwrap(),
+            CommandOutcome::Integer(1)
+        ));
+    }
+
+    #[test]
+    fn execute_exists_miss_returns_integer_zero() {
+        let cache = Cache::default();
+        assert!(matches!(
+            cache.execute(Command::exists("missing")).unwrap(),
+            CommandOutcome::Integer(0)
+        ));
+    }
+
+    #[test]
+    fn execute_expire_existing_returns_bool_true() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert!(matches!(
+            cache.execute(Command::expire("foo", 3600)).unwrap(),
+            CommandOutcome::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn execute_expire_missing_returns_bool_false() {
+        let cache = Cache::default();
+        assert!(matches!(
+            cache.execute(Command::expire("missing", 3600)).unwrap(),
+            CommandOutcome::Bool(false)
+        ));
+    }
+
+    #[test]
+    fn execute_expire_at_existing_returns_bool_true() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert!(matches!(
+            cache
+                .execute(Command::expire_at("foo", now() + 3600))
+                .unwrap(),
+            CommandOutcome::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn execute_expire_at_missing_returns_bool_false() {
+        let cache = Cache::default();
+        assert!(matches!(
+            cache
+                .execute(Command::expire_at("missing", now() + 3600))
+                .unwrap(),
+            CommandOutcome::Bool(false)
+        ));
+    }
+
+    #[test]
+    fn execute_ttl_missing_returns_key_not_found() {
+        let cache = Cache::default();
+        assert!(matches!(
+            cache.execute(Command::ttl("missing")).unwrap(),
+            CommandOutcome::Ttl(TtlOutcome::KeyNotFound)
+        ));
+    }
+
+    #[test]
+    fn execute_ttl_no_ttl_returns_ttl_not_found() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert!(matches!(
+            cache.execute(Command::ttl("foo")).unwrap(),
+            CommandOutcome::Ttl(TtlOutcome::TtlNotFound)
+        ));
+    }
+
+    #[test]
+    fn execute_ttl_with_ttl_returns_ttl_some() {
+        let cache = Cache::default();
+        cache
+            .insert("foo", Entry::new("bar", Some(now() + 3600)))
+            .unwrap();
+        match cache.execute(Command::ttl("foo")).unwrap() {
+            CommandOutcome::Ttl(TtlOutcome::Some(t)) => {
+                assert!((3590_u64..=3600).contains(&t));
+            }
+            other => panic!("expected Ttl(Some), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_persist_had_ttl_returns_bool_true() {
+        let cache = Cache::default();
+        cache
+            .insert("foo", Entry::new("bar", Some(now() + 3600)))
+            .unwrap();
+        assert!(matches!(
+            cache.execute(Command::persist("foo")).unwrap(),
+            CommandOutcome::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn execute_persist_no_ttl_returns_bool_false() {
+        let cache = Cache::default();
+        cache.insert("foo", Entry::new("bar", None)).unwrap();
+        assert!(matches!(
+            cache.execute(Command::persist("foo")).unwrap(),
+            CommandOutcome::Bool(false)
+        ));
+    }
+
+    #[test]
+    fn execute_persist_missing_returns_bool_false() {
+        let cache = Cache::default();
+        assert!(matches!(
+            cache.execute(Command::persist("missing")).unwrap(),
+            CommandOutcome::Bool(false)
+        ));
     }
 
     #[test]

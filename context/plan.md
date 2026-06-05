@@ -54,18 +54,15 @@ This file tracks where the project actually is — milestone status, decisions m
 - [x] Insert of an "already expired" Entry is accepted (no clock check at the boundary). The next read removes it lazily — consistent with the rest of the expiry model. Real Redis does the same.
 - [x] TTL command returns `:-2` for missing, `:-1` for no-TTL, `:n` for seconds remaining.
 
-### M4 — Persistence 🟡 (snapshot exists; AOF is the upgrade target)
-- [x] Snapshot serialize via `wincode`, load on `Cache::init`
-- [x] Truncate + create file on persist
-- [x] Lock released before disk I/O (drop guard before file ops)
-- [x] Persist task loops on a 10s interval (server.rs)
-- [x] Path is now `impl Into<PathBuf>` on both `init` and `persist`; the `CACHE_PATH` const lives in `server.rs` so the cache itself is agnostic. Unblocks multi-instance servers and trivial test isolation.
-- [x] **Decision: move to AOF** — LSM (nighthawk's approach) is rejected here; Redis is in-memory-first, AOF matches the semantic.
-- [ ] **AOF write path** — append every state-mutating command (SET, DEL, eventually EXPIRE) to a log file. `fsync` on each write (or buffered with configurable durability).
-- [ ] **AOF replay on startup** — replay the log to rebuild the in-memory state.
-- [ ] **AOF rewrite (compaction)** — size-based trigger. Background task takes a consistent snapshot of current state, writes a minimal command sequence to a new file, buffers concurrent writes during rewrite, appends them on completion, atomically renames over old AOF. The hard problem: getting a consistent snapshot without blocking writers — Redis uses `fork()` for COW; in Rust threading, simplest is to `clone()` the HashMap under the lock (expensive but simple). Worth thinking about up front.
-- [ ] Crash safety (still applies to whichever model): atomic rename via tempfile.
-- [ ] Pre-AOF cleanup: `Cache::persist` serializes the whole HashMap under the lock (mutex is dropped before disk I/O, but serialize itself is held). Big caches stall writers. Worth fixing or letting AOF supersede it.
+### M4 — Persistence ✅ (snapshot baseline + AOF; hybrid recovery)
+- [x] **Architecture: hexagonal ports.** `CacheRepository` (outbound port) + `CacheService` (inbound port) defined in `domain/ports.rs`; the domain `Service<CR>` orchestrates cache execution + AOF append; the outbound `Persister` implements `CacheRepository`, composing an `Aof` and a `Snapshot` (each a newtype over a shared `PersisterInner` writer+path). Adapter errors map into a domain-owned `RepositoryError` at the boundary.
+- [x] **Snapshot** — `wincode` serialize/deserialize of the whole `HashMap<Vec<u8>, Entry>`. `load` on startup (empty file → empty map). `store` writes to a `.tmp` sibling then atomically `rename`s over the live file — crash-safe, never a half-written snapshot.
+- [x] **AOF write path** — `Service::execute_logged` classifies the command (`MutatingCommand::from_command` → `None` for reads), executes against the cache, then appends the mutation to the log. The AOF entry *is* RESP: `From<MutatingCommand> for Frame` + `Frame::write_to`, byte-for-byte what a client sends. Relative `EXPIRE` is normalized to absolute `EXPIREAT` at encode time so replay is time-invariant. Append mode (`OpenOptions::append`) so restarts extend rather than clobber.
+- [x] **AOF replay on startup** — load snapshot for the baseline, then replay the log on top via the *same* parse path (`Frame::parse_one` → `Command::try_from` → cache-only `execute`, no re-logging). Trailing `Incomplete` frame = torn tail from a crash mid-append → stop cleanly, keep what parsed. Mid-stream parse error or unknown command = fatal (our own log, so an uninterpretable entry means the rebuild can't be trusted). Runs before clients connect, so per-command locking is fine.
+- [x] **Compaction (snapshot-then-truncate)** — taking a snapshot truncates the AOF, so the log only ever holds mutations *since* the last snapshot. Held under the cache lock across both the snapshot write and the AOF clear so no mutation can be wiped in between; order is snapshot-first (durable baseline), then clear (a crash between only re-applies already-snapshotted commands — harmless). Persist task loops on a 10s interval in `server.rs`.
+- [x] Crash safety — atomic temp+rename on snapshot; torn-tail-tolerant replay on the AOF.
+- [ ] **Full AOF rewrite without blocking writers** — the current compaction holds the cache lock for the snapshot duration (clone-under-lock semantics). The novel version — consistent snapshot *without* stalling writers (fork+COW vs. copy-on-write structures vs. a rewrite buffer for concurrent writes) — is still future work. Fine at current scale; revisit under load.
+- [ ] **fsync durability tier** — appends currently buffer through `BufWriter` (durable on flush/drop), no per-write `fsync`. A configurable `everysec`/`always` policy is future work.
 
 ### M5 — Pub/Sub ⬜
 - [ ] PUBLISH / SUBSCRIBE
@@ -78,8 +75,8 @@ This file tracks where the project actually is — milestone status, decisions m
 
 - **Graceful shutdown** — ✅ done. `Arc<AtomicBool>` flag, nonblocking listener with 50ms throttle, stdin-EOF/quit/exit as the trigger (no `ctrlc` crate), all spawned threads join cleanly. Persistence and sweeper threads check the flag on a 100ms-tick budget so shutdown latency is bounded.
 - **Async migration** — currently `std::thread` per connection. Tokio rewrite owed before M5 (broadcast fan-out wants async). Doing it sync first was a deliberate detour to feel the threading model before async hides it.
-- **Connection lifecycle on errors** — `get_command` writes errors back and `continue`s; on a broken stream this can hot-loop. Open. The current shutdown path covers process exit; per-connection wedge cases (idle/stuck clients blocking inside `read`) still want `TcpStream::set_read_timeout` so the repl loop wakes up periodically to check the shutdown flag.
-- **`Session` vs `Cache` error types** — `ReplError` wraps both; the split has held up post-RESP, but worth revisiting once AOF lands.
+- **Connection lifecycle on errors** — ✅ read-timeout wired. Accepted streams get `TcpStream::set_read_timeout(500ms)`; the timeout bubbles up to `repl`, which checks the shutdown flag between waits (`TimedOut`/`WouldBlock` → continue). So an idle client no longer wedges the repl against shutdown. `get_command` still writes errors back and continues on malformed frames (session stays alive).
+- **Service / Session error types** — `SessionError` (renamed from `ReplError`) wraps `io::Error` + `ServiceError`; `ServiceError` is the domain union of `CacheError` + `RepositoryError`. The split has held up through the AOF work — `execute_logged` failures lift cleanly through `?`.
 - **Logging migration** — `tracing` / `tracing-subscriber` are in `Cargo.toml` as prep. Plan: replace the scattered `println!` / `eprintln!` calls in `server.rs` and `session.rs` with structured `tracing` events (`info!` for connection lifecycle, `warn!` for recoverable errors like bad commands, `error!` for session-fatal). Add a `tracing_subscriber::fmt()` init in `main.rs`. Worth doing before AOF so debugging the persist path has real structured logs to grep.
 
 ## Hand-coding vs AI-assist allocation

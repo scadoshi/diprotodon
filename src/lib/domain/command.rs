@@ -44,8 +44,8 @@ pub enum CommandError {
 pub enum Command {
     /// `GET <key>` — fetch the value for `key`, or nil if absent/expired.
     Get { key: Vec<u8> },
-    /// `SET <key> <value>` — insert or replace `key`'s value. TTL handling is up to
-    /// the executor; this variant carries no TTL on its own.
+    /// `SET <key> <value>` — insert or replace `key`'s value. Ttl handling is up to
+    /// the executor; this variant carries no Ttl on its own.
     Set { key: Vec<u8>, value: Vec<u8> },
     /// `DEL <key>` — remove `key` if present.
     Delete { key: Vec<u8> },
@@ -54,17 +54,17 @@ pub enum Command {
     Ping { message: Option<Vec<u8>> },
     /// `EXISTS <key>` — `1` if `key` is present (and not expired), `0` otherwise.
     Exists { key: Vec<u8> },
-    /// `EXPIRE <key> <seconds>` — set a relative TTL on `key`. `relative_ttl` is
+    /// `EXPIRE <key> <seconds>` — set a relative Ttl on `key`. `relative_ttl` is
     /// seconds-from-now; the cache layer converts to absolute UNIX seconds.
     Expire { key: Vec<u8>, relative_ttl: u64 },
-    /// `EXPIREAT <key> <timestamp>` — set an absolute TTL on `key` as UNIX seconds.
+    /// `EXPIREAT <key> <timestamp>` — set an absolute Ttl on `key` as UNIX seconds.
     /// A past timestamp deletes the key immediately (matches real Redis).
     ExpireAt { key: Vec<u8>, absolute_ttl: u64 },
-    /// `TTL <key>` — query remaining TTL in seconds. Replies `:-2` if missing, `:-1`
-    /// if `key` has no TTL, `:n` for seconds remaining.
-    TTL { key: Vec<u8> },
-    /// `PERSIST <key>` — remove the TTL from `key` (keep the value). Replies `:1` if
-    /// a TTL was removed, `:0` if `key` is missing or already had no TTL.
+    /// `Ttl <key>` — query remaining Ttl in seconds. Replies `:-2` if missing, `:-1`
+    /// if `key` has no Ttl, `:n` for seconds remaining.
+    Ttl { key: Vec<u8> },
+    /// `PERSIST <key>` — remove the Ttl from `key` (keep the value). Replies `:1` if
+    /// a Ttl was removed, `:0` if `key` is missing or already had no Ttl.
     Persist { key: Vec<u8> },
 }
 
@@ -98,7 +98,7 @@ impl Command {
         Self::Exists { key: key.into() }
     }
 
-    /// Build a [`Command::Expire`] with a relative TTL in seconds-from-now.
+    /// Build a [`Command::Expire`] with a relative Ttl in seconds-from-now.
     pub fn expire(key: impl Into<Vec<u8>>, relative_ttl: u64) -> Self {
         Self::Expire {
             key: key.into(),
@@ -106,7 +106,7 @@ impl Command {
         }
     }
 
-    /// Build a [`Command::ExpireAt`] with an absolute TTL in UNIX seconds.
+    /// Build a [`Command::ExpireAt`] with an absolute Ttl in UNIX seconds.
     pub fn expire_at(key: impl Into<Vec<u8>>, absolute_ttl: u64) -> Self {
         Self::ExpireAt {
             key: key.into(),
@@ -114,9 +114,9 @@ impl Command {
         }
     }
 
-    /// Build a [`Command::TTL`] from a convertible key.
+    /// Build a [`Command::Ttl`] from a convertible key.
     pub fn ttl(key: impl Into<Vec<u8>>) -> Self {
-        Self::TTL { key: key.into() }
+        Self::Ttl { key: key.into() }
     }
 
     /// Build a [`Command::Persist`] from a convertible key.
@@ -140,7 +140,7 @@ impl MutatingCommand {
             Command::Get { .. }
             | Command::Ping { .. }
             | Command::Exists { .. }
-            | Command::TTL { .. } => None,
+            | Command::Ttl { .. } => None,
             Command::Set { key, value } => Some(Self::Set { key, value }),
             Command::Delete { key } => Some(Self::Delete { key }),
             Command::Expire { key, relative_ttl } => Some(Self::Expire { key, relative_ttl }),
@@ -148,6 +148,23 @@ impl MutatingCommand {
             Command::Persist { key } => Some(Self::Persist { key }),
         }
     }
+}
+
+#[derive(Debug)]
+pub enum TtlOutcome {
+    KeyNotFound,
+    TtlNotFound,
+    Some(u64),
+}
+
+#[derive(Debug)]
+pub enum CommandOutcome {
+    Value(Option<Vec<u8>>),
+    Ok,
+    Bool(bool),
+    Ttl(TtlOutcome),
+    Pong(Option<Vec<u8>>),
+    Integer(i64),
 }
 
 #[cfg(test)]
@@ -236,7 +253,7 @@ mod tests {
     fn ttl_constructor() {
         assert_eq!(
             Command::ttl("foo"),
-            Command::TTL {
+            Command::Ttl {
                 key: b"foo".to_vec()
             }
         );
