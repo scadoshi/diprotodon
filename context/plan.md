@@ -4,20 +4,22 @@ This file tracks where the project actually is — milestone status, decisions m
 
 ## Where I am
 
-**M1 / M2 / M3 complete.** GET / SET / DEL / EXISTS / EXPIRE / EXPIREAT / TTL / PERSIST / PING (with optional message echo) all working end-to-end over real RESP. `redis-cli -p 3000` is the verified client. Session is generic over `R: Read` / `W: Write`; `SessionReader` owns the frame-accumulation buf and handles drain/Incomplete/hard-err paths correctly. Bad commands return `-ERR ...\r\n` SimpleError and the session continues.
+**M1 / M2 / M3 / M4 complete.** GET / SET / DEL / EXISTS / EXPIRE / EXPIREAT / TTL / PERSIST / PING (with optional message echo) all working end-to-end over real RESP. Persistence shipped via hexagonal ports: snapshot baseline (`wincode` + temp+rename) plus an AOF (RESP-encoded mutations) replayed on startup. `redis-cli -p 3000` is the verified client. Session is generic over `R: Read` / `W: Write` / `CS: CacheService`; `SessionReader` owns the frame-accumulation buf and handles drain/Incomplete/hard-err paths correctly. Bad commands return `-ERR ...\r\n` SimpleError and the session continues.
 
 **Graceful shutdown complete.** `Arc<AtomicBool>` shutdown flag, `TcpListener::set_nonblocking(true)` + 50ms throttle on `WouldBlock`, stdin EOF / "quit" / "exit" trigger shutdown, all spawned threads (persistence + sweeper + per-client) are collected via `JoinHandle` and joined cleanly before `Server::run` returns. Persistence and sweeper threads cooperate with the flag via short-tick (100ms × 100) sleep loops so shutdown latency is bounded.
 
-**Testing posture.** 137 unit tests passing. Frame parser, Command-from-Frame, Reply serializer, Crlf, and SessionReader all have unit tests. `Cache` has its own comprehensive unit suite (every public method, including lazy-expiry + init/persist round-trip via a `TmpPath` drop-cleanup helper — no `tempfile` crate). Every error path on every command has explicit coverage in `inbound/resp/command.rs` (TooManyParts, NotEnoughParts, UnexpectedFrame, Utf8/ParseInt for EXPIRE/EXPIREAT ttl). Tests grouped under `// ---------- name ----------` section headers by command/method for navigability. Domain `Command` has constructor tests. The `get_key`/`get_value`/`get_ttl` getter methods on `Command` were dropped — pattern matching at the use site is the idiomatic accessor; getters returned statically-impossible `None`s for most variants.
+**Testing posture.** 219 unit tests passing. Frame parser, Command-from-Frame, Reply serializer, Crlf, and SessionReader all have unit tests. `Cache` has a comprehensive unit suite (every public method, lazy-expiry, past-TTL semantics, bulk remove-expired) plus per-variant coverage of `Cache::execute`. The new persistence layer is fully covered: `Snapshot` round-trip (incl. atomic temp+rename, missing-file error), `Aof` (append → exact RESP bytes, replay, torn-tail tolerance, malformed-frame error, clear), and `Persister` (append + snapshot-then-clear checkpoint, post-snapshot logging resumes). `Service` tests verify `execute` never logs and `execute_logged` appends iff mutating. `Session::execute` has per-variant wire-byte assertions and `get_command` has happy-path + bad-frame + EOF coverage. The `CommandOutcome → Reply` mapping is exhaustively tested. Every error path on every command has explicit coverage in `resp/command.rs`. Tests grouped under `// ---------- name ----------` section headers for navigability. Shared fakes (`RecordingRepo`, `SharedWriter`, `TempPath` RAII temp-file helper) live in `src/lib/test_support.rs` behind `#[cfg(test)]` — no `tempfile` crate.
 
-**Strategic phase shift.** From here forward, work is allocated by *what's novel vs. what's rehearsed*, not by milestone order. The user has already shipped LSM-style persistence (WAL + memtable + SSTable + compaction + bloom filters) in `~/Projects/nighthawk`. That makes append-only-log mechanics rehearsed muscle — AI-assisted is fine. The unrehearsed pieces (pub/sub fan-out, async migration) get hand-written.
+**Strategic phase shift.** From here forward, work is allocated by *what's novel vs. what's rehearsed*, not by milestone order. The user has already shipped LSM-style persistence (WAL + memtable + SSTable + compaction + bloom filters) in `~/Projects/nighthawk`. That makes append-only-log mechanics rehearsed muscle — AI-assisted is fine. The unrehearsed pieces (pub/sub fan-out, MULTI/EXEC, async migration) get hand-written.
 
 ## Testing next up
 
-- ~~**`Cache` unit tests**~~ — done. Every public method covered; lazy-expiry, expired-removal, past-TTL semantics, remove-expired bulk, init/persist round-trip.
-- ~~**`Cache::init` / `persist` testing**~~ — done; path is now `impl Into<PathBuf>` on both, threaded through `Server::run` via a `CACHE_PATH` const in `server.rs`. `TmpPath` test helper handles unique-path + cleanup without a crate.
-- **`Session::execute` per-variant** — Vec<u8> writer + real Cache, assert exact RESP bytes for each Command variant (GET hit/miss, SET, DEL hit/miss, PING with/without message, EXPIRE/EXPIREAT/TTL/PERSIST).
-- **End-to-end `repl`** — Cursor of scripted RESP request bytes as R, Vec<u8> as W, assert exact response bytes. Two tests: happy multi-command flow ending in clean disconnect, and bad-command-mid-stream proving the session continues after a SimpleError.
+Coverage is comprehensive through M4. Outstanding tests are deferred to the features that drive them:
+
+- **End-to-end `repl`** — happy multi-command flow ending in clean disconnect, and bad-command-mid-stream proving the session continues after a SimpleError. Lower-priority since `Session::execute` + `get_command` are both individually tested.
+- **Concurrent persister stress** — multi-threaded append + concurrent snapshot, verifying the checkpoint serialization holds. Owed once we have a real load story.
+- **Subscribed-mode session tests** (M5) — once Pub/Sub lands, sessions in subscribed mode need their command-restriction logic tested.
+- **EXEC atomicity tests** (M6) — once MULTI/EXEC lands, the lock-once-across-the-queue property needs a test where a second session is blocked mid-EXEC and observes a consistent before/after state.
 
 ## Status by milestone
 
@@ -64,12 +66,26 @@ This file tracks where the project actually is — milestone status, decisions m
 - [ ] **Full AOF rewrite without blocking writers** — the current compaction holds the cache lock for the snapshot duration (clone-under-lock semantics). The novel version — consistent snapshot *without* stalling writers (fork+COW vs. copy-on-write structures vs. a rewrite buffer for concurrent writes) — is still future work. Fine at current scale; revisit under load.
 - [ ] **fsync durability tier** — appends currently buffer through `BufWriter` (durable on flush/drop), no per-write `fsync`. A configurable `everysec`/`always` policy is future work.
 
-### M5 — Pub/Sub ⬜
-- [ ] PUBLISH / SUBSCRIBE
-- [ ] Fan-out (probably `std::sync::mpsc` per subscriber, or migrate to tokio broadcast)
+### M5 — Pub/Sub ⬜ (next)
+- [ ] **PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE** — at minimum the first three; pattern subs can come after.
+- [ ] **Subscription registry** — `HashMap<channel, Vec<SubscriberHandle>>` (and a parallel pattern registry) behind a `Mutex` or `RwLock`. SUBSCRIBE registers a handle; UNSUBSCRIBE / disconnect removes it. Reverse index per session so cleanup on disconnect is O(subscribed channels), not O(all channels).
+- [ ] **Fan-out transport** — per-subscriber `std::sync::mpsc::channel` (or `crossbeam`); PUBLISH iterates the channel's subscriber list and `try_send`s a serialized message into each. Slow-subscriber policy decided up front: drop with a count, or disconnect, or unbounded queue (real Redis disconnects past a buffer limit). Pick one, write down why.
+- [ ] **Subscriber output thread** — each subscribed session needs a way to push messages out of band while it's also waiting on client reads. Sync world: a dedicated writer thread per subscribed session draining the mpsc into the socket. Async world: a `tokio::select!` between the socket read and the broadcast receive — much cleaner, which is why this lands easier post-async.
+- [ ] **Subscribed-state command restriction** — once a session is in subscribed mode, only `SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE`/`PING`/`QUIT` are legal. Per-session state flag; reject others with `-ERR`.
+- [ ] **Wire format** — push messages are RESP arrays: `["message", channel, payload]` for plain subs, `["pmessage", pattern, channel, payload]` for pattern subs. Subscribe replies are also arrays (`["subscribe", channel, count]`). Means `Reply` may need a `RespArray` variant or a new `Push` type.
+- [ ] **Decision: sync first or async first.** Sync mpsc-per-subscriber works and teaches the slow-consumer problem viscerally. Tokio `broadcast::channel` makes the registry trivial but hides the lesson. Recommendation: do the async migration first (it's owed anyway), then build Pub/Sub on top.
 
-### M6 — Stretch ⬜
-- [ ] RDB snapshots, MULTI/EXEC, Streams, RESP3
+### M6 — MULTI / EXEC ⬜ (then)
+- [ ] **Session state machine** — sessions get a `Mode { Normal, Queueing }` toggle. `MULTI` flips to `Queueing`; subsequent commands return `+QUEUED\r\n` instead of executing; `EXEC` flushes; `DISCARD` aborts.
+- [ ] **Per-session command queue** — `Vec<Command>` on the `Session`. Commands are parsed (so syntax errors still reject immediately with `-ERR` and abort the transaction per Redis semantics — set a `tx_dirty` flag), just not executed.
+- [ ] **Atomic EXEC** — take the cache lock *once* across the whole queue; execute every command; collect every `CommandOutcome` into an array reply. While the lock is held, no other session interleaves — that's the atomicity guarantee. This is the load-bearing part: it's why EXEC isn't just "loop and call execute_logged."
+- [ ] **AOF interaction** — every queued mutation must hit the log. Options: (a) buffer per-command AOF frames and write them all under the EXEC lock; (b) wrap the whole block in a `MULTI`/`EXEC` envelope frame on disk and have replay re-execute under the same atomic semantics. (b) preserves atomicity on replay, (a) is simpler. Decide before coding.
+- [ ] **Error semantics** — a *parse* error during `Queueing` poisons the transaction: `EXEC` rejects with `-EXECABORT`. A *runtime* error during EXEC (e.g. `INCR` on a non-numeric value, once that exists) does *not* abort — that command's reply is the error, the rest still run. Matches real Redis; future-proofs the design once data types broaden.
+- [ ] **WATCH/UNWATCH (optimistic locking)** — deferred to a follow-up. Real Redis uses WATCH to abort EXEC if a watched key changed between WATCH and EXEC. Interesting but needs a per-key version counter or change-notification hook; punt past the base MULTI/EXEC landing.
+- [ ] **Reply shape** — EXEC reply is a RESP array of N replies (one per queued command). Wants the same `RespArray`/`Push` Reply variant that Pub/Sub needs — build it once.
+
+### M7 — Stretch ⬜
+- [ ] RDB-style snapshot format, Streams (XADD/XREAD), RESP3, INCR/DECR + Lists/Hashes/Sets, WATCH, KEYS/SCAN cursor pattern
 
 ## Cross-cutting work owed
 
@@ -90,6 +106,7 @@ This is the strategic split going forward. The user has already shipped LSM pers
 - **AOF rewrite/compaction design** — the *consistent-snapshot-without-blocking-writers* problem is still novel. Sketch the algorithm by hand (fork+COW vs. clone-the-HashMap vs. copy-on-write structures, how to buffer concurrent writes during rewrite, atomic swap at the end) before writing code. The snapshot strategy is the interesting bit; file mechanics are mechanical.
 - **Async/tokio migration** — paradigm shift, not a feature. Hand-write to feel the model and to have the lived sync→async rewrite experience.
 - **Pub/Sub fan-out (M5)** — different concurrency shape than request/response. mpsc-per-subscriber vs. broadcast tradeoffs, slow-subscriber handling, subscription registry under contention. Easier after async lands (tokio broadcast > std::sync::mpsc fan-out).
+- **MULTI/EXEC (M6)** — first per-session state machine the codebase has. Lock-once-across-the-queue is the atomicity story; the AOF-envelope decision is the interesting secondary call (preserve atomicity on replay vs. flatten and lose it). Decoupled from async; can land before or after.
 
 ### AI-jet (rehearsed in nighthawk or mechanical extension)
 
@@ -105,10 +122,11 @@ This is the strategic split going forward. The user has already shipped LSM pers
 
 1. ~~**EXPIRE/TTL by hand** (M3)~~ — done
 2. ~~**Graceful shutdown by hand**~~ — done
-3. **AOF design by hand, AI scaffolds the code** (M4) — durability story, fork-vs-clone snapshot decision
-4. **Async/tokio migration by hand** — paradigm shift, rewrite experience
-5. **Pub/Sub by hand** (M5) — easier post-async
-6. AI sweeps in between or after: more commands, tracing migration, test gap closure, README updates
+3. ~~**AOF + snapshot by hand** (M4)~~ — done; hexagonal ports landed (`CacheRepository`, `CacheService`, `Service<CR>` orchestrator), snapshot via temp+rename, AOF replay is RESP through the same parse path.
+4. **Async/tokio migration by hand** — paradigm shift, rewrite experience. Owed before M5; Pub/Sub fan-out is the forcing function.
+5. **Pub/Sub by hand** (M5) — broadcast fan-out + slow-subscriber policy + per-session subscribed-mode state machine. Build the `RespArray`/`Push` reply variant here; reused by EXEC.
+6. **MULTI/EXEC by hand** (M6) — first per-session state machine with cross-command atomicity. The lock-once-across-the-queue execution path is the load-bearing lesson; AOF envelope-vs-flat is the secondary decision.
+7. AI sweeps in between or after: more commands (INCR/DECR/MGET/Lists/Hashes), tracing migration, README updates.
 
 ## Discipline note
 
