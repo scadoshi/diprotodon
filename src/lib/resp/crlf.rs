@@ -26,6 +26,7 @@ impl Crlf for [u8] {
             false
         }
     }
+
     fn split_crlf(&self) -> Option<(&[u8], &[u8])> {
         let p = self
             .windows(2)

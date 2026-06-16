@@ -17,7 +17,11 @@
 
 use crate::domain::{
     cache::{Cache, CacheError},
-    command::{Command, CommandOutcome, MutatingCommand},
+    channels::ChannelsError,
+    command::{
+        cache::{CacheCommand, write::WriteCommand},
+        outcome::CommandOutcome,
+    },
 };
 use thiserror::Error;
 
@@ -43,7 +47,7 @@ pub enum RepositoryError {
 /// every session thread (each session holds a clone) and live for the whole process.
 pub trait CacheRepository: Clone + Send + Sync + 'static {
     /// Durably log one state-mutating command (append to the write-ahead log).
-    fn append(&self, mutating_command: MutatingCommand) -> Result<(), RepositoryError>;
+    fn append(&self, command: WriteCommand) -> Result<(), RepositoryError>;
     /// Snapshot the current cache state to durable storage (and compact the log).
     fn snapshot(&self, cache: &Cache) -> Result<(), RepositoryError>;
 }
@@ -62,6 +66,8 @@ pub enum ServiceError {
     /// Persistence failed while logging a mutation.
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+    #[error(transparent)]
+    Channels(#[from] ChannelsError),
     /// Opaque catch-all for anything without a more specific service meaning.
     #[error(transparent)]
     Generic(#[from] Box<dyn std::error::Error + Send + Sync>),
@@ -69,13 +75,14 @@ pub enum ServiceError {
 
 /// Inbound (driving) command port. Implemented by the domain
 /// [`Service`](crate::domain::service::Service) and called by the inbound session, which
-/// supplies the parsed [`Command`] and renders the returned [`CommandOutcome`] as a RESP
+/// supplies the parsed [`Command`](crate::domain::command::Command) and renders the
+/// returned [`CommandOutcome`] as a RESP
 /// reply.
 pub trait CacheService: Clone + Send + Sync + 'static {
     /// Run a command against the cache only — no persistence. Used on the replay path,
     /// where re-logging would duplicate the log.
-    fn execute(&self, command: Command) -> Result<CommandOutcome, ServiceError>;
+    fn execute(&self, command: &CacheCommand) -> Result<CommandOutcome, ServiceError>;
     /// Run a command and, if it mutates state, append it to the write-ahead log. The live
     /// client path.
-    fn execute_logged(&self, command: Command) -> Result<CommandOutcome, ServiceError>;
+    fn execute_logged(&self, command: CacheCommand) -> Result<CommandOutcome, ServiceError>;
 }

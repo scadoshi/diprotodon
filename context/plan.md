@@ -66,7 +66,25 @@ Coverage is comprehensive through M4. Outstanding tests are deferred to the feat
 - [ ] **Full AOF rewrite without blocking writers** — the current compaction holds the cache lock for the snapshot duration (clone-under-lock semantics). The novel version — consistent snapshot *without* stalling writers (fork+COW vs. copy-on-write structures vs. a rewrite buffer for concurrent writes) — is still future work. Fine at current scale; revisit under load.
 - [ ] **fsync durability tier** — appends currently buffer through `BufWriter` (durable on flush/drop), no per-write `fsync`. A configurable `everysec`/`always` policy is future work.
 
-### M5 — Pub/Sub ⬜ (next)
+### M5 — Pub/Sub 🚧 (in progress, `pubsub` branch)
+
+**WIP status (sync-first path chosen — building the per-session writer thread by hand before any async migration):**
+
+*Done — the session transport plumbing is in and verified end-to-end:*
+- Session split into `ReadHalf` (parse + execute + emit) and `WriteHalf` (drain channel → socket), connected by a per-session `mpsc<Vec<u8>>`. `Session::split()` consumes self and hands fields to the two halves; `repl()` spawns the writer thread and runs the reader on the current thread. Only the writer thread touches the socket's write half.
+- `Reply::to_bytes()` added so the reader can encode replies to `Vec<u8>` and `send()` them down the channel instead of writing directly. (Dedup candidate later: `to_bytes` duplicates `write_to`'s per-variant logic — could route one through the other.)
+- Both regressions from the split are fixed: the writer thread now `write_all(...).and_then(flush)`, and the reader loop swallows-and-retries `TimedOut | WouldBlock` (the 500ms read timeout from `server.rs`) instead of ending the session. Smoke-tested with `redis-cli`: PING/SET/GET/EXISTS/DEL all return correct replies and an idle interactive connection survives past the read timeout.
+
+*Next, in rough order — this is where we're leaving off:*
+1. **Subscriber logic + the actual commands.** `PUBLISH` / `SUBSCRIBE` / `UNSUBSCRIBE` don't exist yet — not parsed into `Command`, not executed. This is the bulk of the remaining work (see the unchecked bullets below).
+2. **Shared registry.** `domain::channel` is only a stub today: `Channels = HashMap<Vec<u8>, Vec<Sender<Vec<u8>>>>` with a `ChannelsExt::subscribe`. It is **not** yet (a) shared across sessions behind a `Mutex`/`RwLock`, (b) keyed by session id in the inner collection (needed for O(1) `UNSUBSCRIBE` and disconnect cleanup — switch the inner `Vec<Sender>` to `HashMap<SessionId, Sender>`), or (c) reachable from `ReadHalf` (it needs an `Arc<Mutex<Channels>>` handle to register on SUBSCRIBE and fan out on PUBLISH).
+3. **Wire `ReadHalf`'s dormant fields.** `id` and `subscriptions` (the per-session `HashSet<Vec<u8>>`) are currently dead — that's the two `dead_code` warnings. They light up when SUBSCRIBE/UNSUBSCRIBE land: `id` keys the registry's inner map; `subscriptions` lets no-arg UNSUBSCRIBE and disconnect-cleanup iterate this session's channels without scanning the whole registry.
+4. **Fan-out path.** On PUBLISH, lock the registry, look up the channel, `send()` the serialized `["message", channel, payload]` into every subscriber's `sender` (the same `mpsc` their WriteHalf already drains), prune dead senders, return the surviving count. No new per-subscriber thread needed — the WriteHalf built above already *is* the subscriber output thread.
+
+*Decisions still open:* slow-subscriber policy (unbounded for v1 is fine), whether to enforce subscribed-mode command restriction now or defer it (leaning defer — simpler), and the `Reply` array/`Push` variant for multi-element pub/sub replies.
+
+**Also owed:** session tests are commented out (the old inline `tests` mod assumed the single-threaded `execute`/`writer` shape). Re-home them against `ReadHalf`/`WriteHalf` once the API settles.
+
 - [ ] **PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE** — at minimum the first three; pattern subs can come after.
 - [ ] **Subscription registry** — `HashMap<channel, Vec<SubscriberHandle>>` (and a parallel pattern registry) behind a `Mutex` or `RwLock`. SUBSCRIBE registers a handle; UNSUBSCRIBE / disconnect removes it. Reverse index per session so cleanup on disconnect is O(subscribed channels), not O(all channels).
 - [ ] **Fan-out transport** — per-subscriber `std::sync::mpsc::channel` (or `crossbeam`); PUBLISH iterates the channel's subscriber list and `try_send`s a serialized message into each. Slow-subscriber policy decided up front: drop with a count, or disconnect, or unbounded queue (real Redis disconnects past a buffer limit). Pick one, write down why.

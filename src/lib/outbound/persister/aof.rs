@@ -1,7 +1,7 @@
 //! Append-only command log — the write-ahead log half of the persister.
 //!
 //! The AOF *is* the RESP wire format: each logged command is encoded with the same
-//! `From<MutatingCommand> for Frame` + `Frame::write_to` used on the network path, so the
+//! `From<WriteCommand> for Frame` + `Frame::write_to` used on the network path, so the
 //! file is byte-for-byte what a client would have sent. That symmetry means replay needs
 //! no special decoder — it reuses `Frame::parse_one` + `Command::try_from`, the exact
 //! inbound parsing path. The log is, in effect, a transcript of every mutation; replay is
@@ -10,7 +10,7 @@
 use crate::{
     domain::{
         cache::{Cache, CacheError},
-        command::{Command, MutatingCommand},
+        command::{Command, cache::write::WriteCommand},
         ports::RepositoryError,
     },
     outbound::persister::persister_inner::PersisterInner,
@@ -77,7 +77,7 @@ impl From<PersisterInner> for Aof {
 impl Aof {
     /// Encode one mutation as a RESP frame and append it to the log. Holds the writer lock
     /// across the write so a frame is never interleaved with another thread's append.
-    pub fn append(&self, command: MutatingCommand) -> Result<(), AofError> {
+    pub fn append(&self, command: WriteCommand) -> Result<(), AofError> {
         let mut guard = self.writer.lock().map_err(|_| AofError::MutexPoisoned)?;
         Frame::from(command).write_to(&mut *guard)?;
         Ok(())
@@ -104,9 +104,11 @@ impl Aof {
                 Ok((frame, remainder)) => {
                     bytes = remainder;
                     match Command::try_from(frame) {
-                        Ok(cmd) => {
-                            cache.execute(cmd)?;
+                        Ok(Command::Cache(cc)) => {
+                            cache.execute(&cc)?;
                         }
+                        Ok(Command::Channel(_)) => {}
+                        Ok(Command::Ping { .. }) => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
@@ -150,7 +152,7 @@ mod tests {
     #[test]
     fn append_writes_resp_frame_to_disk() {
         let (aof, t) = fresh();
-        aof.append(MutatingCommand::Set {
+        aof.append(WriteCommand::Set {
             key: b"foo".to_vec(),
             value: b"bar".to_vec(),
         })
@@ -163,19 +165,16 @@ mod tests {
     #[test]
     fn append_multiple_commands_concatenates() {
         let (aof, t) = fresh();
-        aof.append(MutatingCommand::Set {
+        aof.append(WriteCommand::Set {
             key: b"a".to_vec(),
             value: b"1".to_vec(),
         })
         .unwrap();
-        aof.append(MutatingCommand::Delete {
-            key: b"a".to_vec(),
-        })
-        .unwrap();
+        aof.append(WriteCommand::Delete { key: b"a".to_vec() })
+            .unwrap();
         flush(&aof);
         let bytes = fs::read(&t.path).unwrap();
-        let expected =
-            b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*2\r\n$3\r\nDEL\r\n$1\r\na\r\n";
+        let expected = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*2\r\n$3\r\nDEL\r\n$1\r\na\r\n";
         assert_eq!(bytes, expected);
     }
 
@@ -192,7 +191,7 @@ mod tests {
     #[test]
     fn replay_applies_set_to_cache() {
         let (aof, _t) = fresh();
-        aof.append(MutatingCommand::Set {
+        aof.append(WriteCommand::Set {
             key: b"foo".to_vec(),
             value: b"bar".to_vec(),
         })
@@ -206,17 +205,17 @@ mod tests {
     #[test]
     fn replay_applies_commands_in_order() {
         let (aof, _t) = fresh();
-        aof.append(MutatingCommand::Set {
+        aof.append(WriteCommand::Set {
             key: b"foo".to_vec(),
             value: b"old".to_vec(),
         })
         .unwrap();
-        aof.append(MutatingCommand::Set {
+        aof.append(WriteCommand::Set {
             key: b"foo".to_vec(),
             value: b"new".to_vec(),
         })
         .unwrap();
-        aof.append(MutatingCommand::Delete {
+        aof.append(WriteCommand::Delete {
             key: b"gone".to_vec(),
         })
         .unwrap();
@@ -230,12 +229,12 @@ mod tests {
     #[test]
     fn replay_applies_expire_at() {
         let (aof, _t) = fresh();
-        aof.append(MutatingCommand::Set {
+        aof.append(WriteCommand::Set {
             key: b"foo".to_vec(),
             value: b"bar".to_vec(),
         })
         .unwrap();
-        aof.append(MutatingCommand::ExpireAt {
+        aof.append(WriteCommand::ExpireAt {
             key: b"foo".to_vec(),
             absolute_ttl: u64::MAX,
         })
@@ -243,17 +242,14 @@ mod tests {
         flush(&aof);
         let cache = Cache::default();
         aof.replay(&cache).unwrap();
-        assert_eq!(
-            cache.get_absolute_ttl("foo").unwrap(),
-            Some(Some(u64::MAX))
-        );
+        assert_eq!(cache.get_absolute_ttl("foo").unwrap(), Some(Some(u64::MAX)));
     }
 
     #[test]
     fn replay_trailing_partial_frame_is_tolerated() {
         // Incomplete trailing frame should stop replay cleanly (Incomplete is the EOF signal).
         let (aof, t) = fresh();
-        aof.append(MutatingCommand::Set {
+        aof.append(WriteCommand::Set {
             key: b"foo".to_vec(),
             value: b"bar".to_vec(),
         })
@@ -284,7 +280,7 @@ mod tests {
     #[test]
     fn clear_truncates_file() {
         let (aof, t) = fresh();
-        aof.append(MutatingCommand::Set {
+        aof.append(WriteCommand::Set {
             key: b"foo".to_vec(),
             value: b"bar".to_vec(),
         })
@@ -297,14 +293,14 @@ mod tests {
     #[test]
     fn clear_allows_subsequent_appends() {
         let (aof, _t) = fresh();
-        aof.append(MutatingCommand::Set {
+        aof.append(WriteCommand::Set {
             key: b"old".to_vec(),
             value: b"v".to_vec(),
         })
         .unwrap();
         flush(&aof);
         aof.clear().unwrap();
-        aof.append(MutatingCommand::Set {
+        aof.append(WriteCommand::Set {
             key: b"new".to_vec(),
             value: b"v".to_vec(),
         })

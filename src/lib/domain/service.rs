@@ -9,7 +9,7 @@
 
 use crate::domain::{
     cache::Cache,
-    command::{Command, CommandOutcome, MutatingCommand},
+    command::{cache::CacheCommand, outcome::CommandOutcome},
     ports::{CacheRepository, CacheService, ServiceError},
 };
 
@@ -33,24 +33,25 @@ impl<CR: CacheRepository> Service<CR> {
 impl<CR: CacheRepository> CacheService for Service<CR> {
     /// Run a command against the cache only. No persistence — this is the primitive the
     /// replay path uses so rebuilding from the log doesn't re-write the log.
-    fn execute(&self, command: Command) -> Result<CommandOutcome, ServiceError> {
+    fn execute(&self, command: &CacheCommand) -> Result<CommandOutcome, ServiceError> {
         let outcome = self.cache.execute(command)?;
         Ok(outcome)
     }
 
-    /// Run a command and, if it mutates state, append it to the log.
+    /// Run a command and, if it is a [`CacheCommand::Write`], append it to the log.
     ///
-    /// The command is classified *before* execution ([`MutatingCommand::from_command`]
-    /// returns `None` for reads), then executed, then logged. Ordering matters: the cache
-    /// effect and the log append must land in the same order across concurrent writers, or
-    /// replay would diverge from the live cache. Note the cache lock and the log lock are
-    /// taken independently here, so a single lock spanning apply+append (or a single-writer
-    /// model) is what would fully close that window under heavy concurrency.
-    fn execute_logged(&self, command: Command) -> Result<CommandOutcome, ServiceError> {
-        let mutating_command = MutatingCommand::from_command(command.clone());
-        let outcome = self.execute(command)?;
-        if let Some(mutating_command) = mutating_command {
-            self.cache_repo.append(mutating_command)?;
+    /// Reads and writes are already distinguished by the [`CacheCommand`] variant, so the
+    /// command is executed first and then logged only on the `Write` arm. Ordering matters:
+    /// the cache effect and the log append must land in the same order across concurrent
+    /// writers, or replay would diverge from the live cache. Note the cache lock and the log
+    /// lock are taken independently here, so a single lock spanning apply+append (or a
+    /// single-writer model) is what would fully close that window under heavy concurrency.
+    ///
+    /// [`CacheCommand::Write`]: crate::domain::command::cache::CacheCommand::Write
+    fn execute_logged(&self, command: CacheCommand) -> Result<CommandOutcome, ServiceError> {
+        let outcome = self.execute(&command)?;
+        if let CacheCommand::Write(wc) = command {
+            self.cache_repo.append(wc)?;
         }
         Ok(outcome)
     }
@@ -62,7 +63,7 @@ mod tests {
     use crate::{
         domain::{
             cache::Entry,
-            command::{CommandOutcome, MutatingCommand},
+            command::cache::{read::ReadCommand, write::WriteCommand},
         },
         test_support::RecordingRepo,
     };
@@ -80,7 +81,7 @@ mod tests {
     fn execute_get_miss_returns_value_none() {
         let (svc, _, _) = build();
         assert!(matches!(
-            svc.execute(Command::get("missing")).unwrap(),
+            svc.execute(&ReadCommand::get("missing").into()).unwrap(),
             CommandOutcome::Value(None)
         ));
     }
@@ -88,16 +89,16 @@ mod tests {
     #[test]
     fn execute_set_writes_to_cache() {
         let (svc, cache, _) = build();
-        svc.execute(Command::set("foo", "bar")).unwrap();
+        svc.execute(&WriteCommand::set("foo", "bar").into()).unwrap();
         assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("bar", None)));
     }
 
     #[test]
     fn execute_does_not_append_to_repo() {
         let (svc, _, repo) = build();
-        svc.execute(Command::set("foo", "bar")).unwrap();
-        svc.execute(Command::delete("foo")).unwrap();
-        svc.execute(Command::expire("foo", 60)).unwrap();
+        svc.execute(&WriteCommand::set("foo", "bar").into()).unwrap();
+        svc.execute(&WriteCommand::delete("foo").into()).unwrap();
+        svc.execute(&WriteCommand::expire("foo", 60).into()).unwrap();
         assert!(repo.appended.lock().unwrap().is_empty());
     }
 
@@ -106,32 +107,35 @@ mod tests {
     #[test]
     fn execute_logged_set_appends() {
         let (svc, _, repo) = build();
-        svc.execute_logged(Command::set("foo", "bar")).unwrap();
+        svc.execute_logged(WriteCommand::set("foo", "bar").into())
+            .unwrap();
         let log = repo.appended.lock().unwrap();
         assert_eq!(log.len(), 1);
         assert!(matches!(
             &log[0],
-            MutatingCommand::Set { key, value } if key == b"foo" && value == b"bar"
+            WriteCommand::Set { key, value } if key == b"foo" && value == b"bar"
         ));
     }
 
     #[test]
     fn execute_logged_delete_appends() {
         let (svc, _, repo) = build();
-        svc.execute_logged(Command::delete("foo")).unwrap();
+        svc.execute_logged(WriteCommand::delete("foo").into())
+            .unwrap();
         let log = repo.appended.lock().unwrap();
-        assert!(matches!(&log[0], MutatingCommand::Delete { key } if key == b"foo"));
+        assert!(matches!(&log[0], WriteCommand::Delete { key } if key == b"foo"));
     }
 
     #[test]
     fn execute_logged_expire_appends() {
         let (svc, cache, repo) = build();
         cache.insert("foo", Entry::new("bar", None)).unwrap();
-        svc.execute_logged(Command::expire("foo", 60)).unwrap();
+        svc.execute_logged(WriteCommand::expire("foo", 60).into())
+            .unwrap();
         let log = repo.appended.lock().unwrap();
         assert!(matches!(
             &log[0],
-            MutatingCommand::Expire { key, relative_ttl: 60 } if key == b"foo"
+            WriteCommand::Expire { key, relative_ttl: 60 } if key == b"foo"
         ));
     }
 
@@ -139,12 +143,12 @@ mod tests {
     fn execute_logged_expire_at_appends() {
         let (svc, cache, repo) = build();
         cache.insert("foo", Entry::new("bar", None)).unwrap();
-        svc.execute_logged(Command::expire_at("foo", u64::MAX))
+        svc.execute_logged(WriteCommand::expire_at("foo", u64::MAX).into())
             .unwrap();
         let log = repo.appended.lock().unwrap();
         assert!(matches!(
             &log[0],
-            MutatingCommand::ExpireAt { key, absolute_ttl }
+            WriteCommand::ExpireAt { key, absolute_ttl }
                 if key == b"foo" && *absolute_ttl == u64::MAX
         ));
     }
@@ -152,38 +156,31 @@ mod tests {
     #[test]
     fn execute_logged_persist_appends() {
         let (svc, _, repo) = build();
-        svc.execute_logged(Command::persist("foo")).unwrap();
+        svc.execute_logged(WriteCommand::persist("foo").into())
+            .unwrap();
         let log = repo.appended.lock().unwrap();
-        assert!(matches!(&log[0], MutatingCommand::Persist { key } if key == b"foo"));
+        assert!(matches!(&log[0], WriteCommand::Persist { key } if key == b"foo"));
     }
 
     #[test]
     fn execute_logged_get_does_not_append() {
         let (svc, _, repo) = build();
-        svc.execute_logged(Command::get("foo")).unwrap();
-        assert!(repo.appended.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn execute_logged_ping_does_not_append() {
-        let (svc, _, repo) = build();
-        svc.execute_logged(Command::ping(None)).unwrap();
-        svc.execute_logged(Command::ping(Some(b"hi".to_vec())))
-            .unwrap();
+        svc.execute_logged(ReadCommand::get("foo").into()).unwrap();
         assert!(repo.appended.lock().unwrap().is_empty());
     }
 
     #[test]
     fn execute_logged_exists_does_not_append() {
         let (svc, _, repo) = build();
-        svc.execute_logged(Command::exists("foo")).unwrap();
+        svc.execute_logged(ReadCommand::exists("foo").into())
+            .unwrap();
         assert!(repo.appended.lock().unwrap().is_empty());
     }
 
     #[test]
     fn execute_logged_ttl_does_not_append() {
         let (svc, _, repo) = build();
-        svc.execute_logged(Command::ttl("foo")).unwrap();
+        svc.execute_logged(ReadCommand::ttl("foo").into()).unwrap();
         assert!(repo.appended.lock().unwrap().is_empty());
     }
 
@@ -191,7 +188,8 @@ mod tests {
     fn execute_logged_set_returns_ok_outcome() {
         let (svc, _, _) = build();
         assert!(matches!(
-            svc.execute_logged(Command::set("foo", "bar")).unwrap(),
+            svc.execute_logged(WriteCommand::set("foo", "bar").into())
+                .unwrap(),
             CommandOutcome::Ok
         ));
     }

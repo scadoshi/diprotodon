@@ -1,54 +1,62 @@
-//! Per-connection session — the REPL that drives a single TCP client.
+//! The per-connection session: read frames, dispatch commands, push replies.
 //!
-//! [`Session`] owns the buffered reader/writer for one connection and a
-//! [`CacheService`] handle. Its loop is: read bytes → parse a frame → lift it to a
-//! [`Command`] → hand it to the service → map the returned outcome to a [`Reply`] and
-//! write it back. Malformed frames and unknown commands produce a `-ERR ...\r\n` reply
-//! but do not kill the session.
-//!
-//! The session is a pure *streamer* — it moves bytes in and out. Command execution
-//! (cache mutation + persistence) lives behind the service; the session only adds RESP
-//! framing on the way in and the outcome→reply translation on the way out.
-//!
-//! Generic over `R: Read` / `W: Write` so tests can drive a session with a
-//! `Cursor<Vec<u8>>` reader and a `Vec<u8>` writer — no actual TCP needed.
+//! A [`Session`] owns both socket halves. [`Session::split`] divides it into a [`ReadHalf`]
+//! (parses commands, runs them, and *sends* reply bytes down an mpsc) and a [`WriteHalf`]
+//! (the sole owner of the socket's write end — it drains that mpsc to the wire). This split
+//! is what makes pub/sub work: a `PUBLISH` from any session drops bytes into a subscriber's
+//! mpsc, and that subscriber's `WriteHalf` delivers them out of band while its `ReadHalf` is
+//! still blocked on a client read. [`Session::repl`] wires the two together.
 
 use crate::{
     domain::{
-        command::Command,
+        channels::{Channels, ChannelsError, Subscriber},
+        command::{
+            Command,
+            channel::{ChannelCommand, ChannelCommandOutcome, SubUnsubInnerEntry},
+        },
         ports::{CacheService, ServiceError},
     },
     resp::{
         frame::{Frame, FrameError},
-        reply::{Reply, SimpleInner},
+        reply::{Replies, Reply, SimpleInner},
     },
 };
 use std::{
-    io::{BufReader, BufWriter, ErrorKind, Read, Write},
+    collections::HashSet,
+    io::{BufReader, BufWriter, Error as IoError, ErrorKind as IoErrorKind, Read, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, RecvError, SendError, Sender, channel},
     },
+    thread::{JoinHandle, spawn},
 };
 use thiserror::Error;
 
-/// Fatal errors from the REPL loop. Non-fatal errors (bad frames, unknown commands)
-/// are converted to RESP error replies inside the loop and do not surface here.
 #[derive(Debug, Error)]
 pub enum SessionError {
-    /// I/O failed on the socket — the client probably went away.
     #[error(transparent)]
-    Io(#[from] std::io::Error),
-    /// Cache layer error during command execution.
+    ReadHalfError(#[from] ReadHalfError),
     #[error(transparent)]
-    Service(#[from] ServiceError),
+    WriteHalfError(#[from] WriteHalfError),
 }
 
-/// Buffered reader for one connection's incoming byte stream.
-///
-/// Owns an accumulation buffer that survives across `read` calls. The frame parser
-/// drains the prefix it consumes; an `Incomplete` parse preserves the buffer so the
-/// next `read` extends it and parsing can retry with more bytes.
+#[derive(Debug, Error)]
+pub enum ReadHalfError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+    #[error(transparent)]
+    Service(#[from] ServiceError),
+    #[error(transparent)]
+    Send(#[from] SendError<Vec<u8>>),
+}
+
+#[derive(Debug, Error)]
+pub enum WriteHalfError {
+    #[error(transparent)]
+    Recv(#[from] RecvError),
+}
+
 #[derive(Debug)]
 pub struct SessionReader<R: Read> {
     inner: BufReader<R>,
@@ -56,7 +64,6 @@ pub struct SessionReader<R: Read> {
 }
 
 impl<R: Read> SessionReader<R> {
-    /// Wrap a reader. The buffer starts empty; bytes accumulate as `read` is called.
     pub fn new(reader: R) -> Self {
         Self {
             inner: BufReader::new(reader),
@@ -64,8 +71,6 @@ impl<R: Read> SessionReader<R> {
         }
     }
 
-    /// Pull up to 1024 bytes off the underlying reader and append them to the
-    /// accumulation buffer. Returns the number of bytes appended (0 on EOF).
     pub fn read(&mut self) -> std::io::Result<usize> {
         let mut new = [0u8; 1024];
         let len = self.inner.read(&mut new)?;
@@ -73,14 +78,6 @@ impl<R: Read> SessionReader<R> {
         Ok(len)
     }
 
-    /// Try to parse one frame off the front of the buffer. Three outcomes:
-    ///
-    /// - **Ok** — parsed; the consumed prefix is drained from the buffer.
-    /// - **Err(Incomplete)** — buffer preserved unchanged so callers can `read` more
-    ///   bytes and retry.
-    /// - **Err(other)** — buffer is cleared. A hard parse error means the byte stream
-    ///   is no longer aligned with the protocol; resync by dropping everything and
-    ///   starting fresh on the next read.
     pub fn parse_frame(&mut self) -> Result<Frame, FrameError> {
         match Frame::parse_one(&self.buf) {
             Ok((frame, bytes)) => {
@@ -98,38 +95,48 @@ impl<R: Read> SessionReader<R> {
     }
 }
 
-/// One client's REPL state. Generic so it can be driven over real TCP streams or
-/// in-memory test buffers without changing the loop.
+/// A connected client, owning both socket halves until [`split`](Session::split) divides it.
 #[derive(Debug)]
 pub struct Session<R: Read, W: Write, CS: CacheService> {
     id: u32,
     reader: SessionReader<R>,
     writer: BufWriter<W>,
     cache_service: CS,
+    subscriptions: HashSet<Vec<u8>>,
+    global_channels: Channels,
 }
 
-impl<R: Read, W: Write, CS: CacheService> Session<R, W, CS> {
-    /// Build a session for a single connection. `id` is just a numeric tag used in
-    /// connection-lifecycle logs; the cache is shared across all sessions via its
-    /// internal `Arc`.
-    pub fn new(id: u32, reader: R, writer: W, cache_service: CS) -> Self {
-        let writer = BufWriter::new(writer);
-        let reader = SessionReader::new(reader);
-        Self {
-            id,
-            reader,
-            writer,
-            cache_service,
-        }
+/// The reading side of a split session: owns the parser, the cache service, this session's
+/// id and its subscription set, a handle to the shared [`Channels`] registry, and the
+/// *sending* end of the reply mpsc (replies are queued here, not written to the socket).
+pub struct ReadHalf<R: Read, CS: CacheService> {
+    id: u32,
+    reader: SessionReader<R>,
+    cache_service: CS,
+    sender: Sender<Vec<u8>>,
+    subscriptions: HashSet<Vec<u8>>,
+    global_channels: Channels,
+}
+
+/// Build a registry [`Subscriber`] from a read half: its id plus a clone of its reply
+/// sender, so a `PUBLISH` fan-out lands directly in this session's outbound mpsc.
+impl<R: Read, CS: CacheService> From<&ReadHalf<R, CS>> for Subscriber {
+    fn from(value: &ReadHalf<R, CS>) -> Self {
+        Subscriber::new(value.id, value.sender.clone())
+    }
+}
+
+impl<R: Read, CS: CacheService> ReadHalf<R, CS> {
+    /// Queue reply bytes for delivery by pushing them onto the outbound mpsc; the
+    /// [`WriteHalf`] thread drains it to the socket. Errors only if that receiver is gone.
+    pub fn send(&self, bytes: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
+        self.sender.send(bytes)
     }
 
-    /// Read until exactly one frame can be parsed off the buffer.
-    ///
-    /// On `Incomplete`, reads more bytes and retries. On any other parse error, writes
-    /// a `-ERR ...\r\n` to the client and retries — the session stays alive after a
-    /// malformed frame. Returns `Ok(None)` only if the underlying reader ever yields
-    /// `Ok(0)` (clean disconnect).
-    pub fn get_frame(&mut self) -> std::io::Result<Option<Frame>> {
+    /// Read the next complete [`Frame`], reading more bytes when the buffer holds only a
+    /// partial frame. `Ok(None)` signals a clean EOF (client disconnect). A malformed frame
+    /// is answered with a `-ERR` reply and skipped — the session continues.
+    pub fn get_frame(&mut self) -> Result<Option<Frame>, ReadHalfError> {
         loop {
             match self.reader.parse_frame() {
                 Ok(frame) => return Ok(Some(frame)),
@@ -140,27 +147,23 @@ impl<R: Read, W: Write, CS: CacheService> Session<R, W, CS> {
                     continue;
                 }
                 Err(e) => {
-                    Reply::SimpleError(SimpleInner::sanitized(format!("ERR {}", e)))
-                        .write_to(&mut self.writer)?;
-                    self.writer.flush()?;
+                    let reply = Reply::SimpleError(SimpleInner::sanitized(format!("ERR {}", e)));
+                    self.sender.send(reply.to_bytes())?;
                     continue;
                 }
             }
         }
     }
 
-    /// Drive `get_frame` until a frame parses cleanly *and* lifts into a valid
-    /// [`Command`]. If a frame parses but is the wrong shape for a command (bad arity,
-    /// unknown verb, etc.), writes a `-ERR ...\r\n` and pulls the next frame. Returns
-    /// `Ok(None)` only when the underlying reader hits EOF.
-    pub fn get_command(&mut self) -> std::io::Result<Option<Command>> {
+    /// Read the next frame and parse it into a [`Command`]. An unparseable command is
+    /// answered with a `-ERR` reply and skipped; `Ok(None)` is a clean EOF.
+    pub fn get_command(&mut self) -> Result<Option<Command>, ReadHalfError> {
         loop {
             match self.get_frame()?.map(Command::try_from) {
                 Some(Ok(cmd)) => return Ok(Some(cmd)),
                 Some(Err(e)) => {
-                    Reply::SimpleError(SimpleInner::sanitized(format!("ERR {}", e)))
-                        .write_to(&mut self.writer)?;
-                    self.writer.flush()?;
+                    let reply = Reply::SimpleError(SimpleInner::sanitized(format!("ERR {}", e)));
+                    self.sender.send(reply.to_bytes())?;
                     continue;
                 }
                 None => return Ok(None),
@@ -168,272 +171,470 @@ impl<R: Read, W: Write, CS: CacheService> Session<R, W, CS> {
         }
     }
 
-    pub fn execute(&mut self, command: Command) -> Result<(), SessionError> {
-        let reply = Reply::from(self.cache_service.execute_logged(command)?);
-        for _ in 0..10 {
-            match reply.write_to(&mut self.writer) {
-                Ok(_) => break,
-                Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
-                    continue;
+    /// Handle a pub/sub command against the shared registry and this session's subscription
+    /// set, returning the issuer's outcome. The registry mutation runs first (it can fail);
+    /// `subscriptions` is updated only on success, and the cumulative count is read off that
+    /// set. PUBLISH serializes the `["message", channel, payload]` push here, then hands the
+    /// raw bytes to the registry to fan out.
+    pub fn execute_channel_command(
+        &mut self,
+        command: ChannelCommand,
+    ) -> Result<ChannelCommandOutcome, ChannelsError> {
+        let outcome = match command {
+            ChannelCommand::Subscribe { channel_ids } => {
+                let mut inner = Vec::new();
+                for id in channel_ids {
+                    // update global channel handler
+                    // do this first since it can fail
+                    self.global_channels
+                        .subscribe(id.clone(), (&*self).into())?;
+                    // update session specific tracker
+                    self.subscriptions.insert(id.clone());
+                    let subscription_count = self.subscriptions.len();
+                    inner.push(SubUnsubInnerEntry::new(id, subscription_count));
                 }
-                Err(e) => return Err(e.into()),
+                ChannelCommandOutcome::Subscribe { inner }
             }
-        }
-        self.writer.flush()?;
-        Ok(())
+            ChannelCommand::Unsubscribe { channel_ids } => {
+                // No-arg UNSUBSCRIBE means "every channel this session is in". Snapshot the
+                // set into an owned list first — the loop below mutates `self.subscriptions`.
+                let targets: Vec<Vec<u8>> = if channel_ids.is_empty() {
+                    self.subscriptions.iter().cloned().collect()
+                } else {
+                    channel_ids
+                };
+                let mut inner = Vec::new();
+                if targets.is_empty() {
+                    // No-arg UNSUBSCRIBE while subscribed to nothing: one null-channel ack.
+                    inner.push(SubUnsubInnerEntry::new_null(self.subscriptions.len()));
+                } else {
+                    for id in targets {
+                        // update global channel handler
+                        // do this first since it can fail
+                        self.global_channels.unsubscribe(id.clone(), self.id)?;
+                        // update session specific tracker
+                        self.subscriptions.remove(&id);
+                        let subscription_count = self.subscriptions.len();
+                        inner.push(SubUnsubInnerEntry::new(id, subscription_count));
+                    }
+                }
+                ChannelCommandOutcome::Unsubscribe { inner }
+            }
+            ChannelCommand::Publish {
+                channel_id,
+                message,
+            } => {
+                let message = Reply::Array(vec![
+                    Reply::BulkString(b"message".to_vec()),
+                    Reply::BulkString(channel_id.clone()),
+                    Reply::BulkString(message),
+                ])
+                .to_bytes();
+                ChannelCommandOutcome::Publish {
+                    sent_count: self
+                        .global_channels
+                        .publish(message, channel_id.as_slice())?,
+                }
+            }
+        };
+        Ok(outcome)
     }
 
-    /// The REPL — read commands and execute them until the client disconnects or the
-    /// shared `shutdown_signal` flips.
+    /// Remove this session from every channel it joined — the disconnect-cleanup net, run
+    /// once after the repl loop ends so no dead senders linger in the registry. Returns a
+    /// per-channel result so one poisoned removal doesn't abort the rest.
+    pub fn unsubscribe_from_all(&self) -> Vec<Result<(), ChannelsError>> {
+        self.subscriptions
+            .iter()
+            .map(|sub| self.global_channels.unsubscribe(sub, self.id))
+            .collect()
+    }
+}
+
+/// The writing side of a split session: the sole owner of the socket's write end. Its
+/// thread blocks on the reply mpsc and writes whatever it receives — command replies from
+/// this session's own [`ReadHalf`] and pub/sub pushes fanned in from other sessions alike.
+pub struct WriteHalf<W: Write + Send> {
+    writer: BufWriter<W>,
+    receiver: Receiver<Vec<u8>>,
+}
+
+impl<W: Write + Send + 'static> WriteHalf<W> {
+    /// Block until the next buffer of reply bytes is queued. `Err` means every sender has
+    /// been dropped (the session is gone), which ends the writer thread.
+    pub fn recv(&self) -> Result<Vec<u8>, RecvError> {
+        self.receiver.recv()
+    }
+}
+
+impl<R: Read, W: Write + Send + 'static, CS: CacheService> Session<R, W, CS> {
+    /// Build a session over a connected stream's read/write halves, the shared cache
+    /// service, and a handle to the shared channel registry. Starts with no subscriptions.
+    pub fn new(
+        id: u32,
+        reader: R,
+        writer: W,
+        cache_service: CS,
+        global_channels: Channels,
+    ) -> Self {
+        let writer = BufWriter::new(writer);
+        let reader = SessionReader::new(reader);
+        let subscriptions = HashSet::new();
+        Self {
+            id,
+            reader,
+            writer,
+            cache_service,
+            subscriptions,
+            global_channels,
+        }
+    }
+
+    /// Consume the session, create the reply mpsc, and hand the read/write fields to the
+    /// two halves — the [`ReadHalf`] keeps the sender, the [`WriteHalf`] the receiver.
+    pub fn split(self) -> (ReadHalf<R, CS>, WriteHalf<W>) {
+        let Session {
+            id,
+            reader,
+            writer,
+            cache_service,
+            subscriptions,
+            global_channels,
+        } = self;
+        let (sender, receiver) = channel::<Vec<u8>>();
+        let rh = ReadHalf {
+            id,
+            reader,
+            cache_service,
+            sender,
+            subscriptions,
+            global_channels,
+        };
+        let wh = WriteHalf { writer, receiver };
+        (rh, wh)
+    }
+
+    /// Run the session to completion: spawn the writer thread (drains the reply mpsc to the
+    /// socket) and run the reader loop on this thread. Every loop exit — shutdown signal,
+    /// clean EOF, send failure, or read error — funnels through [`unsubscribe_from_all`] so a
+    /// disconnecting session never leaves dead senders in the registry, then joins the
+    /// writer thread before returning.
     ///
-    /// The shutdown check fires *between* commands, so an in-flight command always
-    /// finishes cleanly. A client parked inside an idle `read` won't notice the flag
-    /// until bytes arrive (or until the underlying stream gets a read timeout — see
-    /// the "Connection lifecycle" section of `context/plan.md`).
-    pub fn repl(&mut self, shutdown_signal: Arc<AtomicBool>) -> Result<(), SessionError> {
-        loop {
-            if shutdown_signal.load(Ordering::Relaxed) {
-                break;
-            }
-            match self.get_command() {
-                Ok(Some(cmd)) => self.execute(cmd)?,
-                Ok(None) => {
-                    println!("client {} disconnected", self.id);
+    /// [`unsubscribe_from_all`]: ReadHalf::unsubscribe_from_all
+    pub fn repl(self, shutdown_signal: Arc<AtomicBool>) -> Result<(), SessionError> {
+        let id = self.id;
+        let (mut rh, mut wh) = self.split();
+        let mut handles = Vec::<JoinHandle<()>>::new();
+
+        // writer thread
+        let write_shutdown = shutdown_signal.clone();
+        handles.push(spawn(move || {
+            loop {
+                if write_shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                match wh.recv() {
+                    Ok(msg) => match wh.writer.write_all(&msg).and_then(|_| wh.writer.flush()) {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("failed to write: {}", e),
+                    },
+                    Err(_) => {
+                        println!("client {} has disconnected", id);
+                        break;
+                    }
+                }
+            }
+        }));
+
+        // reader thread
+        let result: Result<(), ReadHalfError> = loop {
+            if shutdown_signal.load(Ordering::Relaxed) {
+                break Ok(());
+            }
+            match rh.get_command() {
+                Ok(Some(Command::Cache(cc))) => {
+                    let reply = Reply::from(
+                        match rh
+                            .cache_service
+                            .execute_logged(cc)
+                            .map_err(ReadHalfError::Service)
+                        {
+                            Ok(outcome) => outcome,
+                            Err(e) => break Err(e),
+                        },
+                    );
+                    match rh.send(reply.to_bytes()) {
+                        Ok(_) => continue,
+                        Err(e) => break Err(ReadHalfError::Send(e)),
+                    }
+                }
+                Ok(Some(Command::Channel(command))) => {
+                    let outcome = match rh
+                        .execute_channel_command(command)
+                        .map_err(ServiceError::from)
+                        .map_err(ReadHalfError::from)
+                    {
+                        Ok(outcome) => outcome,
+                        Err(e) => break Err(e),
+                    };
+                    let replies = Replies::from(outcome);
+                    match rh.send(replies.to_bytes()) {
+                        Ok(_) => continue,
+                        Err(e) => break Err(ReadHalfError::Send(e)),
+                    }
+                }
+                Ok(Some(Command::Ping { message })) => {
+                    let m = message.unwrap_or(Reply::SimpleString(SimpleInner::pong()).to_bytes());
+                    match rh.send(m) {
+                        Ok(_) => continue,
+                        Err(e) => break Err(ReadHalfError::Send(e)),
+                    }
+                }
+                Ok(None) => {
+                    println!("client {} disconnected", id);
+                    break Ok(());
+                }
+                Err(ReadHalfError::Io(e))
+                    if matches!(e.kind(), IoErrorKind::TimedOut | IoErrorKind::WouldBlock) =>
+                {
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => break Err(e),
             }
+        };
+        rh.unsubscribe_from_all().iter().for_each(|r| {
+            if let Err(e) = r {
+                eprintln!("failed to unsubscribe: {}", e)
+            }
+        });
+
+        for h in handles {
+            let _ = h.join();
         }
-        Ok(())
+
+        result.map_err(SessionError::from)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
-
-    #[test]
-    fn session_reader_read() {
-        let mut reader = SessionReader::new(Cursor::new(Vec::from(b"foo")));
-        assert_eq!(reader.read().unwrap(), 3);
-        assert_eq!(reader.read().unwrap(), 0);
-    }
-
-    #[test]
-    fn session_reader_parse_frame_ok() {
-        let mut reader =
-            SessionReader::new(Cursor::new(Vec::from(b"$3\r\nfoo\r\n$3\r\nbar\r\nbaz")));
-        reader.read().unwrap();
-        reader.parse_frame().unwrap();
-        assert_eq!(reader.buf.len(), 12);
-        reader.parse_frame().unwrap();
-        assert_eq!(reader.buf.len(), 3);
-    }
-
-    #[test]
-    fn session_reader_parse_frame_incomplete_error_retains_buf() {
-        let mut reader = SessionReader::new(Cursor::new(Vec::from(b"foo")));
-        reader.read().unwrap();
-        let _ = reader.parse_frame();
-        assert_eq!(reader.buf.len(), 3);
-    }
-
-    #[test]
-    fn session_reader_parse_frame_non_incomplete_errors_clear_buf() {
-        let mut reader = SessionReader::new(Cursor::new(Vec::from(b"foo\r\nbar")));
-        reader.read().unwrap();
-        let _ = reader.parse_frame();
-        assert_eq!(reader.buf.len(), 0);
-    }
-
-    // ---------- execute / get_command ----------
-
     use crate::{
-        domain::{cache::Cache, command::MutatingCommand, service::Service},
+        domain::{cache::Cache, command::channel::ChannelCommand, service::Service},
         test_support::{RecordingRepo, SharedWriter},
     };
+    use std::io::Cursor;
 
-    fn build(
-        input: &[u8],
-    ) -> (
-        Session<Cursor<Vec<u8>>, SharedWriter, Service<RecordingRepo>>,
-        Cache,
-        RecordingRepo,
-        SharedWriter,
-    ) {
-        let cache = Cache::default();
-        let repo = RecordingRepo::default();
-        let service = Service::new(cache.clone(), repo.clone());
-        let writer = SharedWriter::default();
-        let writer_handle = writer.clone();
-        let session = Session::new(0, Cursor::new(input.to_vec()), writer, service);
-        (session, cache, repo, writer_handle)
+    type TestService = Service<RecordingRepo>;
+
+    /// Build a `(ReadHalf, WriteHalf)` pair sharing `channels`. The reader has an empty
+    /// input stream (these tests drive `execute_channel_command` directly, not the repl
+    /// loop); the writer is a `SharedWriter` whose `WriteHalf` receiver we keep to inspect
+    /// what got pushed to this session.
+    fn read_half(
+        id: u32,
+        channels: Channels,
+    ) -> (ReadHalf<Cursor<Vec<u8>>, TestService>, WriteHalf<SharedWriter>) {
+        let service = Service::new(Cache::default(), RecordingRepo::default());
+        let session = Session::new(
+            id,
+            Cursor::new(Vec::new()),
+            SharedWriter::default(),
+            service,
+            channels,
+        );
+        session.split()
     }
 
-    fn flush(session: &mut Session<Cursor<Vec<u8>>, SharedWriter, Service<RecordingRepo>>) {
-        session.writer.flush().unwrap();
+    fn counts(outcome: &ChannelCommandOutcome) -> Vec<usize> {
+        match outcome {
+            ChannelCommandOutcome::Subscribe { inner }
+            | ChannelCommandOutcome::Unsubscribe { inner } => {
+                inner.iter().map(|e| e.subscription_count).collect()
+            }
+            ChannelCommandOutcome::Publish { .. } => panic!("not a sub/unsub outcome"),
+        }
     }
 
-    // ---------- execute: per-variant wire bytes ----------
+    fn channel_ids(outcome: &ChannelCommandOutcome) -> Vec<Option<Vec<u8>>> {
+        match outcome {
+            ChannelCommandOutcome::Subscribe { inner }
+            | ChannelCommandOutcome::Unsubscribe { inner } => {
+                inner.iter().map(|e| e.channel_id.clone()).collect()
+            }
+            ChannelCommandOutcome::Publish { .. } => panic!("not a sub/unsub outcome"),
+        }
+    }
+
+    // ---------- subscribe ----------
 
     #[test]
-    fn execute_set_writes_ok_and_appends_to_log() {
-        let (mut s, cache, repo, written) = build(b"");
-        s.execute(Command::set("foo", "bar")).unwrap();
-        flush(&mut s);
-        assert_eq!(&written.bytes()[..], b"+OK\r\n");
-        assert!(cache.contains("foo").unwrap());
-        assert_eq!(repo.appended.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn execute_get_hit_writes_bulk_string() {
-        let (mut s, cache, _, written) = build(b"");
-        cache
-            .insert("foo", crate::domain::cache::Entry::new("bar", None))
+    fn subscribe_emits_one_entry_per_channel_with_climbing_count() {
+        let (mut rh, _wh) = read_half(1, Channels::new());
+        let outcome = rh
+            .execute_channel_command(ChannelCommand::subscribe(vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+            ]))
             .unwrap();
-        s.execute(Command::get("foo")).unwrap();
-        flush(&mut s);
-        assert_eq!(&written.bytes()[..], b"$3\r\nbar\r\n");
+        assert_eq!(
+            channel_ids(&outcome),
+            vec![
+                Some(b"a".to_vec()),
+                Some(b"b".to_vec()),
+                Some(b"c".to_vec())
+            ]
+        );
+        assert_eq!(counts(&outcome), vec![1, 2, 3]);
     }
 
     #[test]
-    fn execute_get_miss_writes_null_bulk() {
-        let (mut s, _, _, written) = build(b"");
-        s.execute(Command::get("missing")).unwrap();
-        flush(&mut s);
-        assert_eq!(&written.bytes()[..], b"$-1\r\n");
-    }
-
-    #[test]
-    fn execute_delete_hit_writes_integer_one() {
-        let (mut s, cache, _, written) = build(b"");
-        cache
-            .insert("foo", crate::domain::cache::Entry::new("bar", None))
+    fn subscribe_count_is_session_total_across_calls() {
+        let (mut rh, _wh) = read_half(1, Channels::new());
+        rh.execute_channel_command(ChannelCommand::subscribe(vec![b"a".to_vec()]))
             .unwrap();
-        s.execute(Command::delete("foo")).unwrap();
-        flush(&mut s);
-        assert_eq!(&written.bytes()[..], b":1\r\n");
-    }
-
-    #[test]
-    fn execute_delete_miss_writes_integer_zero() {
-        let (mut s, _, _, written) = build(b"");
-        s.execute(Command::delete("foo")).unwrap();
-        flush(&mut s);
-        assert_eq!(&written.bytes()[..], b":0\r\n");
-    }
-
-    #[test]
-    fn execute_ping_without_message_writes_pong() {
-        let (mut s, _, _, written) = build(b"");
-        s.execute(Command::ping(None)).unwrap();
-        flush(&mut s);
-        assert_eq!(&written.bytes()[..], b"+PONG\r\n");
-    }
-
-    #[test]
-    fn execute_ping_with_message_writes_simple_string_of_message() {
-        let (mut s, _, _, written) = build(b"");
-        s.execute(Command::ping(Some(b"hi".to_vec()))).unwrap();
-        flush(&mut s);
-        assert_eq!(&written.bytes()[..], b"+hi\r\n");
-    }
-
-    #[test]
-    fn execute_exists_hit_writes_integer_one() {
-        let (mut s, cache, _, written) = build(b"");
-        cache
-            .insert("foo", crate::domain::cache::Entry::new("bar", None))
+        let outcome = rh
+            .execute_channel_command(ChannelCommand::subscribe(vec![b"b".to_vec()]))
             .unwrap();
-        s.execute(Command::exists("foo")).unwrap();
-        flush(&mut s);
-        assert_eq!(&written.bytes()[..], b":1\r\n");
+        // second call starts from the running total of 1, so b is the session's 2nd channel
+        assert_eq!(counts(&outcome), vec![2]);
     }
 
     #[test]
-    fn execute_ttl_missing_writes_negative_two() {
-        let (mut s, _, _, written) = build(b"");
-        s.execute(Command::ttl("missing")).unwrap();
-        flush(&mut s);
-        assert_eq!(&written.bytes()[..], b":-2\r\n");
-    }
-
-    #[test]
-    fn execute_ttl_no_ttl_writes_negative_one() {
-        let (mut s, cache, _, written) = build(b"");
-        cache
-            .insert("foo", crate::domain::cache::Entry::new("bar", None))
+    fn resubscribe_same_channel_does_not_climb() {
+        let (mut rh, _wh) = read_half(1, Channels::new());
+        rh.execute_channel_command(ChannelCommand::subscribe(vec![b"foo".to_vec()]))
             .unwrap();
-        s.execute(Command::ttl("foo")).unwrap();
-        flush(&mut s);
-        assert_eq!(&written.bytes()[..], b":-1\r\n");
+        let outcome = rh
+            .execute_channel_command(ChannelCommand::subscribe(vec![b"foo".to_vec()]))
+            .unwrap();
+        // already subscribed — the session set didn't grow
+        assert_eq!(counts(&outcome), vec![1]);
+    }
+
+    // ---------- unsubscribe ----------
+
+    #[test]
+    fn unsubscribe_descends_count() {
+        let (mut rh, _wh) = read_half(1, Channels::new());
+        rh.execute_channel_command(ChannelCommand::subscribe(vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+        ]))
+        .unwrap();
+        let outcome = rh
+            .execute_channel_command(ChannelCommand::unsubscribe(vec![
+                b"a".to_vec(),
+                b"c".to_vec(),
+            ]))
+            .unwrap();
+        // remove a -> {b,c}=2 ; remove c -> {b}=1
+        assert_eq!(counts(&outcome), vec![2, 1]);
     }
 
     #[test]
-    fn execute_set_appends_set_to_log() {
-        let (mut s, _, repo, _) = build(b"");
-        s.execute(Command::set("foo", "bar")).unwrap();
-        let log = repo.appended.lock().unwrap();
+    fn unsubscribe_no_args_leaves_every_channel() {
+        let channels = Channels::new();
+        let (mut rh, _wh) = read_half(1, channels.clone());
+        rh.execute_channel_command(ChannelCommand::subscribe(vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+        ]))
+        .unwrap();
+
+        let outcome = rh
+            .execute_channel_command(ChannelCommand::unsubscribe(Vec::<Vec<u8>>::new()))
+            .unwrap();
+
+        // one ack per channel, count draining to zero regardless of removal order
+        assert_eq!(counts(&outcome), vec![2, 1, 0]);
+        let mut acked: Vec<Vec<u8>> = channel_ids(&outcome).into_iter().flatten().collect();
+        acked.sort();
+        assert_eq!(acked, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+
+        // registry is now empty for all three
+        assert_eq!(channels.publish(b"x".to_vec(), b"a").unwrap(), 0);
+        assert_eq!(channels.publish(b"x".to_vec(), b"b").unwrap(), 0);
+        assert_eq!(channels.publish(b"x".to_vec(), b"c").unwrap(), 0);
+    }
+
+    #[test]
+    fn unsubscribe_no_args_while_subscribed_to_nothing_acks_null_channel() {
+        let (mut rh, _wh) = read_half(1, Channels::new());
+        let outcome = rh
+            .execute_channel_command(ChannelCommand::unsubscribe(Vec::<Vec<u8>>::new()))
+            .unwrap();
+        match outcome {
+            ChannelCommandOutcome::Unsubscribe { inner } => {
+                assert_eq!(inner.len(), 1);
+                assert_eq!(inner[0].channel_id, None);
+                assert_eq!(inner[0].subscription_count, 0);
+            }
+            _ => panic!("expected Unsubscribe"),
+        }
+    }
+
+    // ---------- publish (end to end through two sessions) ----------
+
+    #[test]
+    fn publish_delivers_message_array_to_subscriber_and_counts() {
+        let channels = Channels::new();
+        let (mut subscriber, sub_wh) = read_half(1, channels.clone());
+        let (mut publisher, _pub_wh) = read_half(2, channels.clone());
+
+        subscriber
+            .execute_channel_command(ChannelCommand::subscribe(vec![b"foo".to_vec()]))
+            .unwrap();
+        let outcome = publisher
+            .execute_channel_command(ChannelCommand::publish(b"foo", b"bar"))
+            .unwrap();
+
         assert!(matches!(
-            &log[0],
-            MutatingCommand::Set { key, value } if key == b"foo" && value == b"bar"
+            outcome,
+            ChannelCommandOutcome::Publish { sent_count: 1 }
+        ));
+
+        let expected = Reply::Array(vec![
+            Reply::BulkString(b"message".to_vec()),
+            Reply::BulkString(b"foo".to_vec()),
+            Reply::BulkString(b"bar".to_vec()),
+        ])
+        .to_bytes();
+        assert_eq!(sub_wh.recv().unwrap(), expected);
+    }
+
+    #[test]
+    fn publish_to_no_subscribers_reaches_zero() {
+        let (mut publisher, _wh) = read_half(1, Channels::new());
+        let outcome = publisher
+            .execute_channel_command(ChannelCommand::publish(b"foo", b"bar"))
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ChannelCommandOutcome::Publish { sent_count: 0 }
         ));
     }
 
-    #[test]
-    fn execute_get_does_not_append_to_log() {
-        let (mut s, _, repo, _) = build(b"");
-        s.execute(Command::get("foo")).unwrap();
-        assert!(repo.appended.lock().unwrap().is_empty());
-    }
-
-    // ---------- get_command ----------
+    // ---------- disconnect cleanup ----------
 
     #[test]
-    fn get_command_returns_parsed_command() {
-        let (mut s, _, _, _) = build(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
-        let cmd = s.get_command().unwrap();
-        assert_eq!(cmd, Some(Command::get(b"foo")));
-    }
+    fn unsubscribe_from_all_removes_session_from_registry() {
+        let channels = Channels::new();
+        let (mut rh, _wh) = read_half(1, channels.clone());
+        rh.execute_channel_command(ChannelCommand::subscribe(vec![
+            b"foo".to_vec(),
+            b"bar".to_vec(),
+        ]))
+        .unwrap();
 
-    #[test]
-    fn get_command_skips_unknown_verb_and_writes_err() {
-        let input = b"*1\r\n$3\r\nfoo\r\n*2\r\n$3\r\nGET\r\n$3\r\nbar\r\n";
-        let (mut s, _, _, written) = build(input);
-        let cmd = s.get_command().unwrap();
-        flush(&mut s);
-        assert_eq!(cmd, Some(Command::get(b"bar")));
-        let bytes = written.bytes();
-        assert!(
-            bytes.starts_with(b"-ERR "),
-            "expected -ERR prefix, got {:?}",
-            std::str::from_utf8(&bytes)
-        );
-    }
+        let results = rh.unsubscribe_from_all();
+        assert!(results.iter().all(|r| r.is_ok()));
 
-    #[test]
-    fn get_command_dispatches_multiple_commands_in_order() {
-        let input = b"*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
-        let (mut s, _, _, _) = build(input);
-        assert_eq!(s.get_command().unwrap(), Some(Command::ping(None)));
-        assert_eq!(s.get_command().unwrap(), Some(Command::get(b"foo")));
-    }
-
-    #[test]
-    fn get_command_eof_returns_none() {
-        let (mut s, _, _, _) = build(b"");
-        assert_eq!(s.get_command().unwrap(), None);
-    }
-
-    #[test]
-    fn get_command_eof_after_valid_command_returns_none() {
-        let (mut s, _, _, _) = build(b"*1\r\n$4\r\nPING\r\n");
-        assert_eq!(s.get_command().unwrap(), Some(Command::ping(None)));
-        assert_eq!(s.get_command().unwrap(), None);
+        // nothing left to reach on either channel
+        assert_eq!(channels.publish(b"x".to_vec(), b"foo").unwrap(), 0);
+        assert_eq!(channels.publish(b"x".to_vec(), b"bar").unwrap(), 0);
     }
 }

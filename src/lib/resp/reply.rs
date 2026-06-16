@@ -1,7 +1,10 @@
 //! Outbound RESP — the [`Reply`] enum the server emits and the [`SimpleInner`] newtype
 //! that guards RESP's "no CR/LF in simple frames" invariant at construction time.
 
-use std::io::Write;
+use std::{
+    io::Write,
+    ops::{Deref, DerefMut},
+};
 use thiserror::Error;
 
 /// Errors returned by [`SimpleInner::try_from`] when payload bytes contain a
@@ -88,6 +91,11 @@ pub enum Reply {
     /// `:<n>\r\n` — used for boolean-as-int replies (EXISTS, DEL, EXPIRE, PERSIST) and
     /// for TTL's `-2`/`-1`/`n` ladder.
     Integer(i64),
+    /// `*<len>\r\n` followed by each element serialized in turn. RESP arrays are
+    /// heterogeneous, so elements are themselves [`Reply`]s — used for pub/sub acks
+    /// (`["subscribe", channel, count]`) and message pushes (`["message", channel, payload]`),
+    /// and reused by MULTI/EXEC later.
+    Array(Vec<Reply>),
 }
 
 impl Reply {
@@ -95,34 +103,85 @@ impl Reply {
     /// don't leave a half-formed frame on the wire; the caller is expected to flush
     /// after dispatching a reply (the session does this).
     pub fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
+        w.write_all(self.to_bytes().as_slice())
+    }
+
+    /// Serialize this reply to an owned RESP byte buffer. This is the canonical serializer;
+    /// [`write_to`](Self::write_to) is a thin wrapper that streams these bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
         match self {
-            Reply::SimpleString(inner) => {
-                w.write_all(b"+")?;
-                w.write_all(inner.as_bytes())?;
-                w.write_all(b"\r\n")?;
+            Self::SimpleString(inner) => {
+                b.extend_from_slice(b"+");
+                b.extend_from_slice(inner.as_bytes());
+                b.extend_from_slice(b"\r\n");
             }
-            Reply::SimpleError(inner) => {
-                w.write_all(b"-")?;
-                w.write_all(inner.as_bytes())?;
-                w.write_all(b"\r\n")?;
+            Self::SimpleError(inner) => {
+                b.extend_from_slice(b"-");
+                b.extend_from_slice(inner.as_bytes());
+                b.extend_from_slice(b"\r\n");
             }
-            Reply::BulkString(bytes) => {
-                w.write_all(b"$")?;
-                w.write_all(bytes.len().to_string().as_bytes())?;
-                w.write_all(b"\r\n")?;
-                w.write_all(bytes.as_slice())?;
-                w.write_all(b"\r\n")?;
+            Self::BulkString(bytes) => {
+                b.extend_from_slice(b"$");
+                b.extend_from_slice(bytes.len().to_string().as_bytes());
+                b.extend_from_slice(b"\r\n");
+                b.extend_from_slice(bytes);
+                b.extend_from_slice(b"\r\n");
             }
-            Reply::NullBulk => {
-                w.write_all(b"$-1\r\n")?;
+            Self::NullBulk => {
+                b.extend_from_slice(b"$-1\r\n");
             }
-            Reply::Integer(int) => {
-                w.write_all(b":")?;
-                w.write_all(int.to_string().as_bytes())?;
-                w.write_all(b"\r\n")?;
+            Self::Integer(int) => {
+                b.extend_from_slice(b":");
+                b.extend_from_slice(int.to_string().as_bytes());
+                b.extend_from_slice(b"\r\n");
+            }
+            Self::Array(replies) => {
+                b.extend_from_slice(b"*");
+                b.extend_from_slice(replies.len().to_string().as_bytes());
+                b.extend_from_slice(b"\r\n");
+                for reply in replies {
+                    b.extend_from_slice(reply.to_bytes().as_slice());
+                }
             }
         }
+        b
+    }
+}
+
+/// Several independent top-level RESP frames sent back to back — *not* a single array.
+/// A command like `SUBSCRIBE a b` produces one frame per channel; this batches them so they
+/// serialize concatenated, with no enclosing array header.
+#[derive(Debug, Clone)]
+pub struct Replies {
+    pub inner: Vec<Reply>,
+}
+
+impl Replies {
+    /// Stream every frame, in order, onto `buf`.
+    pub fn write_to(&self, buf: &mut impl Write) -> std::io::Result<()> {
+        for reply in &self.inner {
+            reply.write_to(buf)?;
+        }
         Ok(())
+    }
+
+    /// Serialize every frame into one flat buffer — concatenated, no wrapping header.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.inner.iter().flat_map(|r| r.to_bytes()).collect()
+    }
+}
+
+impl Deref for Replies {
+    type Target = Vec<Reply>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for Replies {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
@@ -197,5 +256,105 @@ mod tests {
         let mut buf = Vec::new();
         Reply::Integer(-123).write_to(&mut buf).unwrap();
         assert_eq!(buf, b":-123\r\n");
+    }
+
+    // ---------- Array ----------
+
+    #[test]
+    fn write_to_array_empty() {
+        let mut buf = Vec::new();
+        Reply::Array(vec![]).write_to(&mut buf).unwrap();
+        assert_eq!(buf, b"*0\r\n");
+    }
+
+    #[test]
+    fn write_to_array_mixed_elements() {
+        // The subscribe ack shape: two bulk strings + an integer.
+        let mut buf = Vec::new();
+        Reply::Array(vec![
+            Reply::BulkString(b"subscribe".to_vec()),
+            Reply::BulkString(b"foo".to_vec()),
+            Reply::Integer(1),
+        ])
+        .write_to(&mut buf)
+        .unwrap();
+        assert_eq!(buf, b"*3\r\n$9\r\nsubscribe\r\n$3\r\nfoo\r\n:1\r\n");
+    }
+
+    #[test]
+    fn write_to_array_nested() {
+        let mut buf = Vec::new();
+        Reply::Array(vec![Reply::Array(vec![Reply::Integer(1)]), Reply::Integer(2)])
+            .write_to(&mut buf)
+            .unwrap();
+        assert_eq!(buf, b"*2\r\n*1\r\n:1\r\n:2\r\n");
+    }
+
+    // The header-once bug lived here: `to_bytes` must agree with `write_to` byte-for-byte.
+    #[test]
+    fn to_bytes_array_matches_write_to() {
+        let reply = Reply::Array(vec![
+            Reply::BulkString(b"message".to_vec()),
+            Reply::BulkString(b"foo".to_vec()),
+            Reply::BulkString(b"bar".to_vec()),
+        ]);
+        let mut buf = Vec::new();
+        reply.write_to(&mut buf).unwrap();
+        assert_eq!(reply.to_bytes(), buf);
+        assert_eq!(
+            reply.to_bytes(),
+            b"*3\r\n$7\r\nmessage\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+        );
+    }
+
+    #[test]
+    fn to_bytes_array_empty_matches_write_to() {
+        let reply = Reply::Array(vec![]);
+        let mut buf = Vec::new();
+        reply.write_to(&mut buf).unwrap();
+        assert_eq!(reply.to_bytes(), buf);
+        assert_eq!(reply.to_bytes(), b"*0\r\n");
+    }
+
+    // ---------- Replies (several top-level frames back to back, no outer wrapper) ----------
+
+    #[test]
+    fn replies_to_bytes_concatenates_frames_without_wrapper() {
+        // SUBSCRIBE foo bar emits two *separate* arrays, not one array-of-arrays.
+        let replies = Replies {
+            inner: vec![
+                Reply::Array(vec![
+                    Reply::BulkString(b"subscribe".to_vec()),
+                    Reply::BulkString(b"foo".to_vec()),
+                    Reply::Integer(1),
+                ]),
+                Reply::Array(vec![
+                    Reply::BulkString(b"subscribe".to_vec()),
+                    Reply::BulkString(b"bar".to_vec()),
+                    Reply::Integer(2),
+                ]),
+            ],
+        };
+        assert_eq!(
+            replies.to_bytes(),
+            b"*3\r\n$9\r\nsubscribe\r\n$3\r\nfoo\r\n:1\r\n\
+              *3\r\n$9\r\nsubscribe\r\n$3\r\nbar\r\n:2\r\n"
+        );
+    }
+
+    #[test]
+    fn replies_to_bytes_empty_is_empty() {
+        let replies = Replies { inner: vec![] };
+        assert_eq!(replies.to_bytes(), b"");
+    }
+
+    #[test]
+    fn replies_to_bytes_matches_write_to() {
+        let replies = Replies {
+            inner: vec![Reply::Integer(1), Reply::Integer(2)],
+        };
+        let mut buf = Vec::new();
+        replies.write_to(&mut buf).unwrap();
+        assert_eq!(replies.to_bytes(), buf);
     }
 }

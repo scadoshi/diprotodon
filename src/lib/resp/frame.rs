@@ -5,7 +5,7 @@
 //! That's the entire surface a client uses to send commands; outbound reply types
 //! (simple strings, errors, integers, null-bulk) live in the outbound layer.
 
-use crate::{domain::command::MutatingCommand, resp::crlf::Crlf};
+use crate::{domain::command::cache::write::WriteCommand, resp::crlf::Crlf};
 use std::{io::Write, num::ParseIntError, str::Utf8Error};
 use thiserror::Error;
 
@@ -128,30 +128,30 @@ impl Frame {
     }
 }
 
-type MC = MutatingCommand;
-impl From<MC> for Frame {
-    fn from(value: MC) -> Self {
+type WC = WriteCommand;
+impl From<WC> for Frame {
+    fn from(value: WC) -> Self {
         match value {
-            MC::Set { key, value } => Frame::Array(vec![
+            WC::Set { key, value } => Frame::Array(vec![
                 Frame::BulkString(b"SET".to_vec()),
                 Frame::BulkString(key),
                 Frame::BulkString(value),
             ]),
-            MC::Delete { key } => Frame::Array(vec![
+            WC::Delete { key } => Frame::Array(vec![
                 Frame::BulkString(b"DEL".to_vec()),
                 Frame::BulkString(key),
             ]),
-            MC::Expire { key, relative_ttl } => Frame::Array(vec![
+            WC::Expire { key, relative_ttl } => Frame::Array(vec![
                 Frame::BulkString(b"EXPIRE".to_vec()),
                 Frame::BulkString(key),
                 Frame::BulkString(relative_ttl.to_string().as_bytes().to_vec()),
             ]),
-            MC::ExpireAt { key, absolute_ttl } => Frame::Array(vec![
+            WC::ExpireAt { key, absolute_ttl } => Frame::Array(vec![
                 Frame::BulkString(b"EXPIREAT".to_vec()),
                 Frame::BulkString(key),
                 Frame::BulkString(absolute_ttl.to_string().as_bytes().to_vec()),
             ]),
-            MC::Persist { key } => Frame::Array(vec![
+            WC::Persist { key } => Frame::Array(vec![
                 Frame::BulkString(b"PERSIST".to_vec()),
                 Frame::BulkString(key),
             ]),
