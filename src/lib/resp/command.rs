@@ -142,6 +142,43 @@ impl TryFrom<Frame> for Command {
                         }
                         Ok(Command::persist(key))
                     }
+                    b"subscribe" => {
+                        let mut channel_ids: Vec<Vec<u8>> = Vec::new();
+                        for frame in iter {
+                            let Frame::BulkString(channel) = frame else {
+                                return Err(CommandFromFrameError::UnexpectedFrame);
+                            };
+                            channel_ids.push(channel);
+                        }
+                        if channel_ids.is_empty() {
+                            return Err(CommandError::NotEnoughParts.into());
+                        }
+                        Ok(Command::subscribe(channel_ids))
+                    }
+                    b"unsubscribe" => {
+                        let mut channel_ids: Vec<Vec<u8>> = Vec::new();
+                        for frame in iter {
+                            let Frame::BulkString(channel) = frame else {
+                                return Err(CommandFromFrameError::UnexpectedFrame);
+                            };
+                            channel_ids.push(channel);
+                        }
+                        Ok(Command::unsubscribe(channel_ids))
+                    }
+                    b"publish" => {
+                        let (Some(channel), Some(message)) = (iter.next(), iter.next()) else {
+                            return Err(CommandError::NotEnoughParts.into());
+                        };
+                        let (Frame::BulkString(channel), Frame::BulkString(message)) =
+                            (channel, message)
+                        else {
+                            return Err(CommandFromFrameError::UnexpectedFrame);
+                        };
+                        if iter.next().is_some() {
+                            return Err(CommandError::TooManyParts.into());
+                        }
+                        Ok(Command::publish(channel, message))
+                    }
                     _ => Err(CommandError::UnrecognizedCommand.into()),
                 }
             }
@@ -838,6 +875,144 @@ mod tests {
             Command::try_from(Frame::Array(vec![
                 Frame::BulkString(b"persist".to_vec()),
                 Frame::Array(vec![]),
+            ])),
+            Err(CommandFromFrameError::UnexpectedFrame)
+        ));
+    }
+
+    // ---------- SUBSCRIBE ----------
+
+    #[test]
+    fn try_from_frame_ok_subscribe_single() {
+        assert_eq!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"subscribe".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+            ]))
+            .unwrap(),
+            Command::subscribe(vec![b"foo".to_vec()])
+        );
+    }
+
+    #[test]
+    fn try_from_frame_ok_subscribe_multiple() {
+        assert_eq!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"SUBSCRIBE".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+                Frame::BulkString(b"bar".to_vec()),
+            ]))
+            .unwrap(),
+            Command::subscribe(vec![b"foo".to_vec(), b"bar".to_vec()])
+        );
+    }
+
+    #[test]
+    fn try_from_frame_err_subscribe_no_channels() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![Frame::BulkString(b"subscribe".to_vec())])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::NotEnoughParts
+            ))
+        ));
+    }
+
+    #[test]
+    fn try_from_frame_err_subscribe_non_bulk_channel() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"subscribe".to_vec()),
+                Frame::Array(vec![]),
+            ])),
+            Err(CommandFromFrameError::UnexpectedFrame)
+        ));
+    }
+
+    // ---------- UNSUBSCRIBE ----------
+
+    #[test]
+    fn try_from_frame_ok_unsubscribe_single() {
+        assert_eq!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"unsubscribe".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+            ]))
+            .unwrap(),
+            Command::unsubscribe(vec![b"foo".to_vec()])
+        );
+    }
+
+    // No-arg UNSUBSCRIBE is legal — it means "every channel this session is in".
+    #[test]
+    fn try_from_frame_ok_unsubscribe_no_channels() {
+        assert_eq!(
+            Command::try_from(Frame::Array(vec![Frame::BulkString(b"unsubscribe".to_vec())]))
+                .unwrap(),
+            Command::unsubscribe(Vec::<Vec<u8>>::new())
+        );
+    }
+
+    #[test]
+    fn try_from_frame_err_unsubscribe_non_bulk_channel() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"unsubscribe".to_vec()),
+                Frame::Array(vec![]),
+            ])),
+            Err(CommandFromFrameError::UnexpectedFrame)
+        ));
+    }
+
+    // ---------- PUBLISH ----------
+
+    #[test]
+    fn try_from_frame_ok_publish() {
+        assert_eq!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"publish".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+                Frame::BulkString(b"bar".to_vec()),
+            ]))
+            .unwrap(),
+            Command::publish(b"foo", b"bar")
+        );
+    }
+
+    #[test]
+    fn try_from_frame_err_publish_not_enough_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"publish".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+            ])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::NotEnoughParts
+            ))
+        ));
+    }
+
+    #[test]
+    fn try_from_frame_err_publish_too_many_parts() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"publish".to_vec()),
+                Frame::BulkString(b"foo".to_vec()),
+                Frame::BulkString(b"bar".to_vec()),
+                Frame::BulkString(b"baz".to_vec()),
+            ])),
+            Err(CommandFromFrameError::CommandError(
+                CommandError::TooManyParts
+            ))
+        ));
+    }
+
+    #[test]
+    fn try_from_frame_err_publish_non_bulk_arg() {
+        assert!(matches!(
+            Command::try_from(Frame::Array(vec![
+                Frame::BulkString(b"publish".to_vec()),
+                Frame::Array(vec![]),
+                Frame::BulkString(b"bar".to_vec()),
             ])),
             Err(CommandFromFrameError::UnexpectedFrame)
         ));

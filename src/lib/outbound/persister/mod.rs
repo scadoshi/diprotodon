@@ -23,7 +23,7 @@ pub mod snapshot;
 use crate::{
     domain::{
         cache::Cache,
-        command::MutatingCommand,
+        command::cache::write::WriteCommand,
         ports::{CacheRepository, RepositoryError},
     },
     outbound::persister::{aof::Aof, persister_inner::PersisterInner, snapshot::Snapshot},
@@ -77,7 +77,7 @@ impl Persister {
 }
 
 impl CacheRepository for Persister {
-    fn append(&self, command: MutatingCommand) -> Result<(), RepositoryError> {
+    fn append(&self, command: WriteCommand) -> Result<(), RepositoryError> {
         self.aof.append(command)?;
         Ok(())
     }
@@ -120,7 +120,8 @@ mod tests {
         let aof_path = TempPath::new("persister_aof");
         let snapshot_path = TempPath::new("persister_snapshot");
         let aof = Aof::from(PersisterInner::try_from(aof_path.path.clone()).unwrap());
-        let snapshot = Snapshot::from(PersisterInner::try_from(snapshot_path.path.clone()).unwrap());
+        let snapshot =
+            Snapshot::from(PersisterInner::try_from(snapshot_path.path.clone()).unwrap());
         Built {
             persister: Persister { aof, snapshot },
             aof_path,
@@ -132,7 +133,7 @@ mod tests {
     fn append_writes_to_aof_only() {
         let t = fresh();
         t.persister
-            .append(MutatingCommand::Set {
+            .append(WriteCommand::Set {
                 key: b"foo".to_vec(),
                 value: b"bar".to_vec(),
             })
@@ -150,14 +151,17 @@ mod tests {
         cache.insert("foo", Entry::new("bar", None)).unwrap();
         t.persister.snapshot(&cache).unwrap();
         let loaded = t.persister.snapshot.load().unwrap();
-        assert_eq!(loaded.get(b"foo".as_slice()), Some(&Entry::new("bar", None)));
+        assert_eq!(
+            loaded.get(b"foo".as_slice()),
+            Some(&Entry::new("bar", None))
+        );
     }
 
     #[test]
     fn snapshot_clears_the_aof() {
         let t = fresh();
         t.persister
-            .append(MutatingCommand::Set {
+            .append(WriteCommand::Set {
                 key: b"foo".to_vec(),
                 value: b"bar".to_vec(),
             })
@@ -180,7 +184,7 @@ mod tests {
         t.persister.snapshot(&cache).unwrap();
 
         t.persister
-            .append(MutatingCommand::Delete {
+            .append(WriteCommand::Delete {
                 key: b"foo".to_vec(),
             })
             .unwrap();

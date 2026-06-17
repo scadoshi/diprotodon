@@ -16,6 +16,7 @@
 //! persistence strategy change without touching the core.
 
 pub mod cache;
+pub mod channels;
 pub mod command;
 pub mod ports;
 pub mod service;

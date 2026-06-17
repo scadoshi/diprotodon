@@ -20,7 +20,9 @@
 //! burning a CPU when no clients are connecting.
 
 use crate::{
-    domain::{cache::Cache, ports::CacheRepository, service::Service as CacheService},
+    domain::{
+        cache::Cache, channels::Channels, ports::CacheRepository, service::Service as CacheService,
+    },
     inbound::session::Session,
     outbound::persister::Persister,
 };
@@ -53,6 +55,7 @@ impl Server {
         cache.remove_expired()?;
 
         let cache_service = CacheService::new(cache.clone(), persister.clone());
+        let channels = Channels::new();
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut id = 0;
@@ -133,8 +136,9 @@ impl Server {
                 Ok((writer_stream, _)) => {
                     let shutdown_clone = shutdown.clone();
                     id += 1;
-                    println!("client number {} connected", id);
+                    println!("client {} connected", id);
                     let cache_service_clone = cache_service.clone();
+                    let channels_clone = channels.clone();
                     handles.push(spawn(move || {
                         let reader_stream = match writer_stream.try_clone() {
                             Ok(stream) => stream,
@@ -148,8 +152,13 @@ impl Server {
                         {
                             eprintln!("failed to set stream read timeout: {}", e);
                         }
-                        let mut session =
-                            Session::new(id, reader_stream, writer_stream, cache_service_clone);
+                        let session = Session::new(
+                            id,
+                            reader_stream,
+                            writer_stream,
+                            cache_service_clone,
+                            channels_clone,
+                        );
                         match session.repl(shutdown_clone) {
                             Ok(_) => (),
                             Err(e) => eprintln!("failed to repl: {}", e),

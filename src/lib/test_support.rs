@@ -3,7 +3,7 @@
 
 use crate::domain::{
     cache::Cache,
-    command::MutatingCommand,
+    command::cache::write::WriteCommand,
     ports::{CacheRepository, RepositoryError},
 };
 use std::{
@@ -19,12 +19,12 @@ use std::{
 /// [`CacheRepository`] fake that records every appended command. Snapshot calls are no-ops.
 #[derive(Clone, Default)]
 pub struct RecordingRepo {
-    pub appended: Arc<Mutex<Vec<MutatingCommand>>>,
+    pub appended: Arc<Mutex<Vec<WriteCommand>>>,
 }
 
 impl CacheRepository for RecordingRepo {
-    fn append(&self, command: MutatingCommand) -> Result<(), RepositoryError> {
-        self.appended.lock().unwrap().push(command);
+    fn append(&self, command: WriteCommand) -> Result<(), RepositoryError> {
+        self.appended.lock().unwrap().push(command.clone());
         Ok(())
     }
     fn snapshot(&self, _cache: &Cache) -> Result<(), RepositoryError> {

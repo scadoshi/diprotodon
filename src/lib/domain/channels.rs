@@ -1,0 +1,245 @@
+//! The pub/sub subscription registry and message fan-out.
+//!
+//! [`Channels`] maps each channel name to its [`Subscribers`] and is shared by every
+//! session behind an `Arc<Mutex>`. It is cheap to [`Clone`] (a clone shares the inner
+//! `Arc`), so every session holds a handle to the *same* registry. The registry deals
+//! only in raw `Vec<u8>` payloads — RESP framing is the inbound layer's job; here a
+//! published message is just bytes pushed into each subscriber's channel.
+
+use thiserror::Error;
+
+use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+    sync::{
+        Arc, Mutex,
+        mpsc::{SendError, Sender},
+    },
+};
+
+/// One session's delivery endpoint: its id (the registry key) plus the sending half of the
+/// mpsc that the session's `WriteHalf` drains to the socket.
+#[derive(Debug)]
+pub struct Subscriber {
+    id: u32,
+    sender: Sender<Vec<u8>>,
+}
+
+impl Subscriber {
+    /// Wrap a session id and its mpsc sender as a registry entry.
+    pub fn new(id: u32, sender: Sender<Vec<u8>>) -> Self {
+        Self { id, sender }
+    }
+
+    /// Push raw bytes toward this subscriber's socket. Errors if the receiving `WriteHalf`
+    /// has been dropped (i.e. the session is gone).
+    pub fn send(&self, message: impl Into<Vec<u8>>) -> Result<(), SendError<Vec<u8>>> {
+        self.sender.send(message.into())
+    }
+}
+
+/// The subscribers of a single channel, keyed by session id so unsubscribe and
+/// disconnect-cleanup are O(1) and a session can't be double-registered to one channel.
+#[derive(Debug, Default)]
+pub struct Subscribers {
+    inner: HashMap<u32, Sender<Vec<u8>>>,
+}
+
+impl Deref for Subscribers {
+    type Target = HashMap<u32, Sender<Vec<u8>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for Subscribers {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+/// Errors from registry operations.
+#[derive(Debug, Error)]
+pub enum ChannelsError {
+    /// A thread panicked while holding the registry lock, poisoning the `Mutex`.
+    #[error("mutex was poisoned")]
+    MutexPoisoned,
+}
+
+/// The shared subscription registry: channel name → its [`Subscribers`]. Cloneable; every
+/// clone points at the same inner map via the shared `Arc`.
+#[derive(Debug, Default, Clone)]
+pub struct Channels {
+    channels: Arc<Mutex<HashMap<Vec<u8>, Subscribers>>>,
+}
+
+impl Channels {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `subscriber` under `channel_id`, creating the channel on first subscribe.
+    /// Idempotent per session id — re-subscribing the same session replaces its sender. The
+    /// per-session subscription *count* is the caller's bookkeeping, not the registry's.
+    pub fn subscribe(
+        &self,
+        channel_id: impl Into<Vec<u8>>,
+        subscriber: Subscriber,
+    ) -> Result<(), ChannelsError> {
+        let mut guard = self
+            .channels
+            .lock()
+            .map_err(|_| ChannelsError::MutexPoisoned)?;
+        guard
+            .entry(channel_id.into())
+            .or_default()
+            .insert(subscriber.id, subscriber.sender.clone());
+        Ok(())
+    }
+
+    /// Remove this subscriber from `channel_id`, dropping the channel entirely once its
+    /// last subscriber leaves so the map only ever holds live channels. A no-op if the
+    /// channel or subscriber isn't present.
+    pub fn unsubscribe(
+        &self,
+        channel_id: impl AsRef<[u8]>,
+        subscriber_id: u32,
+    ) -> Result<(), ChannelsError> {
+        let mut guard = self
+            .channels
+            .lock()
+            .map_err(|_| ChannelsError::MutexPoisoned)?;
+        if let Some(subs) = guard.get_mut(channel_id.as_ref()) {
+            subs.remove(&subscriber_id);
+            if subs.is_empty() {
+                guard.remove(channel_id.as_ref());
+            }
+        }
+        Ok(())
+    }
+
+    /// Fan `message` out to every subscriber of `channel_id`, returning how many received
+    /// it. Subscribers whose receiver has been dropped (dead sessions) are pruned in
+    /// passing. `message` is delivered verbatim — the caller pre-serializes the RESP push.
+    pub fn publish(
+        &self,
+        message: impl AsRef<Vec<u8>>,
+        channel_id: &[u8],
+    ) -> Result<u32, ChannelsError> {
+        let mut sent_count = 0;
+        let mut guard = self
+            .channels
+            .lock()
+            .map_err(|_| ChannelsError::MutexPoisoned)?;
+        if let Some(subs) = guard.get_mut(channel_id) {
+            subs.retain(
+                |_id, sender| match sender.send(message.as_ref().to_owned()) {
+                    Ok(()) => {
+                        sent_count += 1;
+                        true
+                    }
+                    Err(_) => false,
+                },
+            );
+        }
+        Ok(sent_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::{Receiver, channel};
+
+    /// Register a fresh subscriber on `channel_id` and hand back the receiver end so the
+    /// test can assert what got delivered.
+    fn subscribe(channels: &Channels, id: u32, channel_id: &[u8]) -> Receiver<Vec<u8>> {
+        let (tx, rx) = channel::<Vec<u8>>();
+        channels
+            .subscribe(channel_id.to_vec(), Subscriber::new(id, tx))
+            .unwrap();
+        rx
+    }
+
+    #[test]
+    fn subscribe_then_publish_delivers_payload() {
+        let channels = Channels::new();
+        let rx = subscribe(&channels, 1, b"foo");
+        let reached = channels.publish(b"hello".to_vec(), b"foo").unwrap();
+        assert_eq!(reached, 1);
+        assert_eq!(rx.recv().unwrap(), b"hello".to_vec());
+    }
+
+    #[test]
+    fn publish_to_unknown_channel_reaches_zero() {
+        let channels = Channels::new();
+        assert_eq!(channels.publish(b"hello".to_vec(), b"nope").unwrap(), 0);
+    }
+
+    #[test]
+    fn publish_only_reaches_subscribers_of_that_channel() {
+        let channels = Channels::new();
+        let foo_rx = subscribe(&channels, 1, b"foo");
+        let _bar_rx = subscribe(&channels, 2, b"bar");
+        assert_eq!(channels.publish(b"hi".to_vec(), b"foo").unwrap(), 1);
+        assert_eq!(foo_rx.recv().unwrap(), b"hi".to_vec());
+    }
+
+    #[test]
+    fn multiple_subscribers_all_receive_and_count() {
+        let channels = Channels::new();
+        let rx1 = subscribe(&channels, 1, b"foo");
+        let rx2 = subscribe(&channels, 2, b"foo");
+        assert_eq!(channels.publish(b"yo".to_vec(), b"foo").unwrap(), 2);
+        assert_eq!(rx1.recv().unwrap(), b"yo".to_vec());
+        assert_eq!(rx2.recv().unwrap(), b"yo".to_vec());
+    }
+
+    #[test]
+    fn unsubscribe_stops_delivery() {
+        let channels = Channels::new();
+        let rx = subscribe(&channels, 1, b"foo");
+        channels.unsubscribe(b"foo", 1).unwrap();
+        assert_eq!(channels.publish(b"hi".to_vec(), b"foo").unwrap(), 0);
+        // The sender end is gone from the registry, so nothing was delivered.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn resubscribe_same_id_is_idempotent() {
+        // Re-subscribing the same session id to the same channel must not double-count.
+        let channels = Channels::new();
+        let (tx, rx) = channel::<Vec<u8>>();
+        channels
+            .subscribe(b"foo".to_vec(), Subscriber::new(1, tx.clone()))
+            .unwrap();
+        channels
+            .subscribe(b"foo".to_vec(), Subscriber::new(1, tx))
+            .unwrap();
+        assert_eq!(channels.publish(b"hi".to_vec(), b"foo").unwrap(), 1);
+        assert_eq!(rx.recv().unwrap(), b"hi".to_vec());
+    }
+
+    #[test]
+    fn publish_prunes_dead_subscribers() {
+        let channels = Channels::new();
+        let live_rx = subscribe(&channels, 1, b"foo");
+        let dead_rx = subscribe(&channels, 2, b"foo");
+        drop(dead_rx); // session 2's receiver is gone
+
+        // First publish sees the dead sender, delivers to the live one, prunes the dead.
+        assert_eq!(channels.publish(b"one".to_vec(), b"foo").unwrap(), 1);
+        assert_eq!(live_rx.recv().unwrap(), b"one".to_vec());
+
+        // Second publish: dead sender already pruned, count stays at 1.
+        assert_eq!(channels.publish(b"two".to_vec(), b"foo").unwrap(), 1);
+        assert_eq!(live_rx.recv().unwrap(), b"two".to_vec());
+    }
+
+    #[test]
+    fn unsubscribe_unknown_channel_is_noop() {
+        let channels = Channels::new();
+        assert!(channels.unsubscribe(b"ghost", 1).is_ok());
+    }
+}

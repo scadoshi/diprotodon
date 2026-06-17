@@ -20,7 +20,10 @@
 //! in the outbound persister (`outbound::persister`): a `wincode`-serialized snapshot of
 //! the `HashMap<Vec<u8>, Entry>` plus an append-only command log replayed on startup.
 
-use crate::domain::command::{Command, CommandOutcome, TtlOutcome};
+use crate::domain::command::{
+    cache::{CacheCommand, read::ReadCommand, write::WriteCommand},
+    outcome::{CommandOutcome, TtlOutcome},
+};
 use std::{
     collections::HashMap,
     ops::Deref,
@@ -287,34 +290,32 @@ impl Cache {
         Ok(expired.len())
     }
 
-    pub fn execute(&self, command: Command) -> Result<CommandOutcome, CacheError> {
+    pub fn execute(&self, command: &CacheCommand) -> Result<CommandOutcome, CacheError> {
+        use ReadCommand as R;
+        use WriteCommand as W;
         let outcome = match command {
-            Command::Get { key } => {
-                let value = self.get(&key)?;
-                match value {
-                    Some(Entry { value, .. }) => CommandOutcome::Value(Some(value)),
-                    None => CommandOutcome::Value(None),
-                }
-            }
-            Command::Set { key, value } => {
-                self.insert(key.as_slice(), Entry::new(value.as_slice(), None))?;
-                CO::Ok
-            }
-            Command::Delete { key } => CO::Bool(self.remove(&key)?.is_some()),
-            Command::Ping { message } => CO::Pong(message),
-            Command::Exists { key } => CO::Integer(self.contains(&key)? as i64),
-            Command::Expire { key, relative_ttl } => {
-                CO::Bool(self.set_relative_ttl(&key, relative_ttl)?)
-            }
-            Command::ExpireAt { key, absolute_ttl } => {
-                CO::Bool(self.set_absolute_ttl(&key, absolute_ttl)?)
-            }
-            Command::Ttl { key } => CO::Ttl(match self.get_relative_ttl(&key)? {
+            CacheCommand::Read(R::Get { key }) => match self.get(key)? {
+                Some(Entry { value, .. }) => CO::Value(Some(value)),
+                None => CO::Value(None),
+            },
+            CacheCommand::Read(R::Exists { key }) => CO::Integer(self.contains(key)? as i64),
+            CacheCommand::Read(R::Ttl { key }) => CO::Ttl(match self.get_relative_ttl(key)? {
                 None => TtlOutcome::KeyNotFound,
                 Some(None) => TtlOutcome::TtlNotFound,
                 Some(Some(ttl)) => TtlOutcome::Some(ttl),
             }),
-            Command::Persist { key } => CO::Bool(self.remove_ttl(&key)?),
+            CacheCommand::Write(W::Set { key, value }) => {
+                self.insert(key.as_slice(), Entry::new(value.as_slice(), None))?;
+                CO::Ok
+            }
+            CacheCommand::Write(W::Delete { key }) => CO::Bool(self.remove(key)?.is_some()),
+            CacheCommand::Write(W::Expire { key, relative_ttl }) => {
+                CO::Bool(self.set_relative_ttl(key, *relative_ttl)?)
+            }
+            CacheCommand::Write(W::ExpireAt { key, absolute_ttl }) => {
+                CO::Bool(self.set_absolute_ttl(key, *absolute_ttl)?)
+            }
+            CacheCommand::Write(W::Persist { key }) => CO::Bool(self.remove_ttl(key)?),
         };
         Ok(outcome)
     }
@@ -708,11 +709,36 @@ mod tests {
 
     // ---------- execute ----------
 
+    fn get(key: impl Into<Vec<u8>>) -> CacheCommand {
+        ReadCommand::get(key).into()
+    }
+    fn set(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> CacheCommand {
+        WriteCommand::set(key, value).into()
+    }
+    fn delete(key: impl Into<Vec<u8>>) -> CacheCommand {
+        WriteCommand::delete(key).into()
+    }
+    fn exists(key: impl Into<Vec<u8>>) -> CacheCommand {
+        ReadCommand::exists(key).into()
+    }
+    fn expire(key: impl Into<Vec<u8>>, relative_ttl: u64) -> CacheCommand {
+        WriteCommand::expire(key, relative_ttl).into()
+    }
+    fn expire_at(key: impl Into<Vec<u8>>, absolute_ttl: u64) -> CacheCommand {
+        WriteCommand::expire_at(key, absolute_ttl).into()
+    }
+    fn ttl(key: impl Into<Vec<u8>>) -> CacheCommand {
+        ReadCommand::ttl(key).into()
+    }
+    fn persist(key: impl Into<Vec<u8>>) -> CacheCommand {
+        WriteCommand::persist(key).into()
+    }
+
     #[test]
     fn execute_get_miss_returns_value_none() {
         let cache = Cache::default();
         assert!(matches!(
-            cache.execute(Command::get("missing")).unwrap(),
+            cache.execute(&get("missing")).unwrap(),
             CommandOutcome::Value(None)
         ));
     }
@@ -721,7 +747,7 @@ mod tests {
     fn execute_get_hit_returns_value_some() {
         let cache = Cache::default();
         cache.insert("foo", Entry::new("bar", None)).unwrap();
-        match cache.execute(Command::get("foo")).unwrap() {
+        match cache.execute(&get("foo")).unwrap() {
             CommandOutcome::Value(Some(v)) => assert_eq!(v, b"bar".to_vec()),
             other => panic!("expected Value(Some), got {:?}", other),
         }
@@ -732,7 +758,7 @@ mod tests {
         let cache = Cache::default();
         cache.insert("foo", Entry::new("bar", Some(1))).unwrap();
         assert!(matches!(
-            cache.execute(Command::get("foo")).unwrap(),
+            cache.execute(&get("foo")).unwrap(),
             CommandOutcome::Value(None)
         ));
     }
@@ -741,7 +767,7 @@ mod tests {
     fn execute_set_returns_ok_and_inserts() {
         let cache = Cache::default();
         assert!(matches!(
-            cache.execute(Command::set("foo", "bar")).unwrap(),
+            cache.execute(&set("foo", "bar")).unwrap(),
             CommandOutcome::Ok
         ));
         assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("bar", None)));
@@ -751,7 +777,7 @@ mod tests {
     fn execute_set_overwrites() {
         let cache = Cache::default();
         cache.insert("foo", Entry::new("old", None)).unwrap();
-        cache.execute(Command::set("foo", "new")).unwrap();
+        cache.execute(&set("foo", "new")).unwrap();
         assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("new", None)));
     }
 
@@ -760,7 +786,7 @@ mod tests {
         let cache = Cache::default();
         cache.insert("foo", Entry::new("bar", None)).unwrap();
         assert!(matches!(
-            cache.execute(Command::delete("foo")).unwrap(),
+            cache.execute(&delete("foo")).unwrap(),
             CommandOutcome::Bool(true)
         ));
         assert!(!cache.contains("foo").unwrap());
@@ -770,27 +796,9 @@ mod tests {
     fn execute_delete_miss_returns_bool_false() {
         let cache = Cache::default();
         assert!(matches!(
-            cache.execute(Command::delete("missing")).unwrap(),
+            cache.execute(&delete("missing")).unwrap(),
             CommandOutcome::Bool(false)
         ));
-    }
-
-    #[test]
-    fn execute_ping_without_message_returns_pong_none() {
-        let cache = Cache::default();
-        assert!(matches!(
-            cache.execute(Command::ping(None)).unwrap(),
-            CommandOutcome::Pong(None)
-        ));
-    }
-
-    #[test]
-    fn execute_ping_with_message_returns_pong_some() {
-        let cache = Cache::default();
-        match cache.execute(Command::ping(Some(b"hi".to_vec()))).unwrap() {
-            CommandOutcome::Pong(Some(m)) => assert_eq!(m, b"hi".to_vec()),
-            other => panic!("expected Pong(Some), got {:?}", other),
-        }
     }
 
     #[test]
@@ -798,7 +806,7 @@ mod tests {
         let cache = Cache::default();
         cache.insert("foo", Entry::new("bar", None)).unwrap();
         assert!(matches!(
-            cache.execute(Command::exists("foo")).unwrap(),
+            cache.execute(&exists("foo")).unwrap(),
             CommandOutcome::Integer(1)
         ));
     }
@@ -807,7 +815,7 @@ mod tests {
     fn execute_exists_miss_returns_integer_zero() {
         let cache = Cache::default();
         assert!(matches!(
-            cache.execute(Command::exists("missing")).unwrap(),
+            cache.execute(&exists("missing")).unwrap(),
             CommandOutcome::Integer(0)
         ));
     }
@@ -817,7 +825,7 @@ mod tests {
         let cache = Cache::default();
         cache.insert("foo", Entry::new("bar", None)).unwrap();
         assert!(matches!(
-            cache.execute(Command::expire("foo", 3600)).unwrap(),
+            cache.execute(&expire("foo", 3600)).unwrap(),
             CommandOutcome::Bool(true)
         ));
     }
@@ -826,7 +834,7 @@ mod tests {
     fn execute_expire_missing_returns_bool_false() {
         let cache = Cache::default();
         assert!(matches!(
-            cache.execute(Command::expire("missing", 3600)).unwrap(),
+            cache.execute(&expire("missing", 3600)).unwrap(),
             CommandOutcome::Bool(false)
         ));
     }
@@ -836,9 +844,7 @@ mod tests {
         let cache = Cache::default();
         cache.insert("foo", Entry::new("bar", None)).unwrap();
         assert!(matches!(
-            cache
-                .execute(Command::expire_at("foo", now() + 3600))
-                .unwrap(),
+            cache.execute(&expire_at("foo", now() + 3600)).unwrap(),
             CommandOutcome::Bool(true)
         ));
     }
@@ -847,9 +853,7 @@ mod tests {
     fn execute_expire_at_missing_returns_bool_false() {
         let cache = Cache::default();
         assert!(matches!(
-            cache
-                .execute(Command::expire_at("missing", now() + 3600))
-                .unwrap(),
+            cache.execute(&expire_at("missing", now() + 3600)).unwrap(),
             CommandOutcome::Bool(false)
         ));
     }
@@ -858,7 +862,7 @@ mod tests {
     fn execute_ttl_missing_returns_key_not_found() {
         let cache = Cache::default();
         assert!(matches!(
-            cache.execute(Command::ttl("missing")).unwrap(),
+            cache.execute(&ttl("missing")).unwrap(),
             CommandOutcome::Ttl(TtlOutcome::KeyNotFound)
         ));
     }
@@ -868,7 +872,7 @@ mod tests {
         let cache = Cache::default();
         cache.insert("foo", Entry::new("bar", None)).unwrap();
         assert!(matches!(
-            cache.execute(Command::ttl("foo")).unwrap(),
+            cache.execute(&ttl("foo")).unwrap(),
             CommandOutcome::Ttl(TtlOutcome::TtlNotFound)
         ));
     }
@@ -879,7 +883,7 @@ mod tests {
         cache
             .insert("foo", Entry::new("bar", Some(now() + 3600)))
             .unwrap();
-        match cache.execute(Command::ttl("foo")).unwrap() {
+        match cache.execute(&ttl("foo")).unwrap() {
             CommandOutcome::Ttl(TtlOutcome::Some(t)) => {
                 assert!((3590_u64..=3600).contains(&t));
             }
@@ -894,7 +898,7 @@ mod tests {
             .insert("foo", Entry::new("bar", Some(now() + 3600)))
             .unwrap();
         assert!(matches!(
-            cache.execute(Command::persist("foo")).unwrap(),
+            cache.execute(&persist("foo")).unwrap(),
             CommandOutcome::Bool(true)
         ));
     }
@@ -904,7 +908,7 @@ mod tests {
         let cache = Cache::default();
         cache.insert("foo", Entry::new("bar", None)).unwrap();
         assert!(matches!(
-            cache.execute(Command::persist("foo")).unwrap(),
+            cache.execute(&persist("foo")).unwrap(),
             CommandOutcome::Bool(false)
         ));
     }
@@ -913,7 +917,7 @@ mod tests {
     fn execute_persist_missing_returns_bool_false() {
         let cache = Cache::default();
         assert!(matches!(
-            cache.execute(Command::persist("missing")).unwrap(),
+            cache.execute(&persist("missing")).unwrap(),
             CommandOutcome::Bool(false)
         ));
     }
