@@ -6,7 +6,11 @@ use std::{num::ParseIntError, str::Utf8Error};
 use thiserror::Error;
 
 use crate::domain::command::{
-    cache::{CacheCommand, read::ReadCommand, write::WriteCommand},
+    cache::{
+        CacheCommand,
+        read::ReadCommand,
+        write::{SetOptions, WriteCommand},
+    },
     channel::ChannelCommand,
 };
 
@@ -60,8 +64,12 @@ impl Command {
         ReadCommand::get(key).into()
     }
 
-    pub fn set(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
-        WriteCommand::set(key, value).into()
+    pub fn set(
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+        options: Option<SetOptions>,
+    ) -> Self {
+        WriteCommand::set(key, value, options).into()
     }
 
     pub fn delete(key: impl Into<Vec<u8>>) -> Self {
@@ -70,10 +78,6 @@ impl Command {
 
     pub fn exists(key: impl Into<Vec<u8>>) -> Self {
         ReadCommand::exists(key).into()
-    }
-
-    pub fn expire(key: impl Into<Vec<u8>>, relative_ttl: u64) -> Self {
-        WriteCommand::expire(key, relative_ttl).into()
     }
 
     pub fn expire_at(key: impl Into<Vec<u8>>, absolute_ttl: u64) -> Self {

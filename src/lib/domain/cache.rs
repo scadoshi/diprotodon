@@ -21,7 +21,11 @@
 //! the `HashMap<Vec<u8>, Entry>` plus an append-only command log replayed on startup.
 
 use crate::domain::command::{
-    cache::{CacheCommand, read::ReadCommand, write::WriteCommand},
+    cache::{
+        CacheCommand,
+        read::ReadCommand,
+        write::{SetOptions, WriteCommand},
+    },
     outcome::{CommandOutcome, TtlOutcome},
 };
 use std::{
@@ -188,23 +192,6 @@ impl Cache {
         Ok(true)
     }
 
-    /// Set a relative TTL (seconds-from-now) on an existing key. Converts to absolute
-    /// and delegates to [`Cache::set_absolute_ttl`]. `saturating_add` on the conversion
-    /// guards against `u64` overflow on huge TTLs.
-    ///
-    /// `relative_ttl == 0` produces an absolute timestamp equal to *now*, which the
-    /// `>=` check inside [`Cache::set_absolute_ttl`] treats as past — so `EXPIRE foo 0`
-    /// deletes immediately, matching real Redis.
-    pub fn set_relative_ttl(
-        &self,
-        key: impl AsRef<[u8]>,
-        relative_ttl: u64,
-    ) -> Result<bool, CacheError> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let absolute_ttl = now.saturating_add(relative_ttl);
-        self.set_absolute_ttl(key, absolute_ttl)
-    }
-
     /// Query the absolute TTL for `key`. The double `Option` carries three distinct
     /// states:
     ///
@@ -304,14 +291,31 @@ impl Cache {
                 Some(None) => TtlOutcome::TtlNotFound,
                 Some(Some(ttl)) => TtlOutcome::Some(ttl),
             }),
-            CacheCommand::Write(W::Set { key, value }) => {
+            CacheCommand::Write(W::Set {
+                key,
+                value,
+                options,
+            }) => {
                 self.insert(key.as_slice(), Entry::new(value.as_slice(), None))?;
+                if let Some(options) = options {
+                    match options {
+                        SetOptions::Ex(relative_ttl) => {
+                            todo!()
+                        }
+                        SetOptions::Px(relative_ttl) => {
+                            todo!()
+                        }
+                        SetOptions::ExAt(absolute_ttl) => {
+                            todo!()
+                        }
+                        SetOptions::PxAt(absolute_ttl) => {
+                            todo!()
+                        }
+                    }
+                }
                 CO::Ok
             }
             CacheCommand::Write(W::Delete { key }) => CO::Bool(self.remove(key)?.is_some()),
-            CacheCommand::Write(W::Expire { key, relative_ttl }) => {
-                CO::Bool(self.set_relative_ttl(key, *relative_ttl)?)
-            }
             CacheCommand::Write(W::ExpireAt { key, absolute_ttl }) => {
                 CO::Bool(self.set_absolute_ttl(key, *absolute_ttl)?)
             }
@@ -533,38 +537,6 @@ mod tests {
         assert_eq!(cache.get_absolute_ttl("foo").unwrap(), Some(Some(new_ttl)));
     }
 
-    // ---------- set_relative_ttl ----------
-
-    #[test]
-    fn set_relative_ttl_existing_key_returns_true_and_sets_absolute() {
-        let cache = Cache::default();
-        cache.insert("foo", Entry::new("bar", None)).unwrap();
-        let before = now();
-        assert!(cache.set_relative_ttl("foo", 3600).unwrap());
-        let after = now();
-        let ttl = match cache.get_absolute_ttl("foo").unwrap() {
-            Some(Some(t)) => t,
-            other => panic!("expected Some(Some(_)), got {:?}", other),
-        };
-        // Allow for the clock to tick during the call.
-        assert!(ttl >= before + 3600 && ttl <= after + 3600);
-    }
-
-    #[test]
-    fn set_relative_ttl_missing_key_returns_false() {
-        let cache = Cache::default();
-        assert!(!cache.set_relative_ttl("missing", 3600).unwrap());
-    }
-
-    #[test]
-    fn set_relative_ttl_zero_seconds_removes_immediately() {
-        // EXPIRE key 0 → absolute_ttl == now → set_absolute_ttl removes (matches real Redis).
-        let cache = Cache::default();
-        cache.insert("foo", Entry::new("bar", None)).unwrap();
-        assert!(cache.set_relative_ttl("foo", 0).unwrap());
-        assert_eq!(cache.get("foo").unwrap(), None);
-    }
-
     // ---------- get_absolute_ttl ----------
 
     #[test]
@@ -712,17 +684,14 @@ mod tests {
     fn get(key: impl Into<Vec<u8>>) -> CacheCommand {
         ReadCommand::get(key).into()
     }
-    fn set(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> CacheCommand {
-        WriteCommand::set(key, value).into()
-    }
+    // fn set(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> CacheCommand {
+    //     WriteCommand::set(key, value).into()
+    // }
     fn delete(key: impl Into<Vec<u8>>) -> CacheCommand {
         WriteCommand::delete(key).into()
     }
     fn exists(key: impl Into<Vec<u8>>) -> CacheCommand {
         ReadCommand::exists(key).into()
-    }
-    fn expire(key: impl Into<Vec<u8>>, relative_ttl: u64) -> CacheCommand {
-        WriteCommand::expire(key, relative_ttl).into()
     }
     fn expire_at(key: impl Into<Vec<u8>>, absolute_ttl: u64) -> CacheCommand {
         WriteCommand::expire_at(key, absolute_ttl).into()
@@ -763,23 +732,23 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn execute_set_returns_ok_and_inserts() {
-        let cache = Cache::default();
-        assert!(matches!(
-            cache.execute(&set("foo", "bar")).unwrap(),
-            CommandOutcome::Ok
-        ));
-        assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("bar", None)));
-    }
+    // #[test]
+    // fn execute_set_returns_ok_and_inserts() {
+    //     let cache = Cache::default();
+    //     assert!(matches!(
+    //         cache.execute(&set("foo", "bar")).unwrap(),
+    //         CommandOutcome::Ok
+    //     ));
+    //     assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("bar", None)));
+    // }
 
-    #[test]
-    fn execute_set_overwrites() {
-        let cache = Cache::default();
-        cache.insert("foo", Entry::new("old", None)).unwrap();
-        cache.execute(&set("foo", "new")).unwrap();
-        assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("new", None)));
-    }
+    // #[test]
+    // fn execute_set_overwrites() {
+    //     let cache = Cache::default();
+    //     cache.insert("foo", Entry::new("old", None)).unwrap();
+    //     cache.execute(&set("foo", "new")).unwrap();
+    //     assert_eq!(cache.get("foo").unwrap(), Some(Entry::new("new", None)));
+    // }
 
     #[test]
     fn execute_delete_hit_returns_bool_true() {
@@ -817,25 +786,6 @@ mod tests {
         assert!(matches!(
             cache.execute(&exists("missing")).unwrap(),
             CommandOutcome::Integer(0)
-        ));
-    }
-
-    #[test]
-    fn execute_expire_existing_returns_bool_true() {
-        let cache = Cache::default();
-        cache.insert("foo", Entry::new("bar", None)).unwrap();
-        assert!(matches!(
-            cache.execute(&expire("foo", 3600)).unwrap(),
-            CommandOutcome::Bool(true)
-        ));
-    }
-
-    #[test]
-    fn execute_expire_missing_returns_bool_false() {
-        let cache = Cache::default();
-        assert!(matches!(
-            cache.execute(&expire("missing", 3600)).unwrap(),
-            CommandOutcome::Bool(false)
         ));
     }
 

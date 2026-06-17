@@ -132,19 +132,21 @@ type WC = WriteCommand;
 impl From<WC> for Frame {
     fn from(value: WC) -> Self {
         match value {
-            WC::Set { key, value } => Frame::Array(vec![
-                Frame::BulkString(b"SET".to_vec()),
-                Frame::BulkString(key),
-                Frame::BulkString(value),
-            ]),
+            WC::Set {
+                key,
+                value,
+                options,
+            } => {
+                todo!("handle set options here");
+                Frame::Array(vec![
+                    Frame::BulkString(b"SET".to_vec()),
+                    Frame::BulkString(key),
+                    Frame::BulkString(value),
+                ])
+            }
             WC::Delete { key } => Frame::Array(vec![
                 Frame::BulkString(b"DEL".to_vec()),
                 Frame::BulkString(key),
-            ]),
-            WC::Expire { key, relative_ttl } => Frame::Array(vec![
-                Frame::BulkString(b"EXPIRE".to_vec()),
-                Frame::BulkString(key),
-                Frame::BulkString(relative_ttl.to_string().as_bytes().to_vec()),
             ]),
             WC::ExpireAt { key, absolute_ttl } => Frame::Array(vec![
                 Frame::BulkString(b"EXPIREAT".to_vec()),
